@@ -1,0 +1,8 @@
+{
+  "sub-feat/Rv1.1.7-bf1": {
+    "pltf": {
+      "branch": "snap/Rv1.1.7",
+      "commit": "d48690a4d40be29a9cff624dab90c83c9468630d"
+    }
+  }
+}
