@@ -776,6 +776,13 @@ Hiện tại đối với các ticket PLTF-014 >> 016 thì sẽ cân nhắc đư
 - [x] @! TID[epic=Rv1.1.7-bf1/docs] DOCS-010 <+ Bổ sung chi tiết quản lý độ ưu tiên task và logging trong `user-manual` (VN/EN). //REF - commit 010ff39
 - [x] @! TID[epic=Rv1.1.7-bf1/docs] DOCS-011 <+ Cập nhật tham chiếu và loại bỏ cú pháp APE đã deprecated trong `docs/vni/uels-syntax.md`. //REF - commit c60e550
 - [x] @! TID[epic=Rv1.1.7-bf1/docs] DOCS-012 <+ Làm rõ mô tả tính năng APE cho xử lý task khẩn cấp trong `README.md`. //REF - commit 2f88560
+- [x] @! TID[epic=Rv1.1.8-i0/tool.test-runner] TOOL-001 <+ Cập nhật template test runner (`testc.txt`) để sửa anchor và đơn giản hóa luồng thực thi scenario. //REF - commit a68f2cb
+- [x] @! TID[epic=Rv1.1.8-i0/tool.test-runner] TOOL-002 <+ Refine xử lý YAML và xử lý lỗi cho section `tezuit` trong `testgen.py`. //REF - commit 20251fa
+- [x] @! TID[epic=Rv1.1.8-i0/tool.entrypoint] TOOL-003 <+ Cập nhật đường dẫn file YAML nguồn sang `tezprjec.yaml` trong `ntrypont.py`. //REF - commit 5772d35
+- [x] @! TID[epic=Rv1.1.8-i0/tool.gitsp] TOOL-004 <+ Bổ sung lựa chọn version và cải thiện logic gợi ý số ticket trong `gitsp.py`. //REF - commit b6145e6
+- [x] @! TID[epic=Rv1.1.8-i0/docs.test-spec] DOCS-013 <+ Cập nhật mô tả mức kiểm thử và chi tiết cú pháp tezcal trong `docs/test/test-spec.md`. //REF - commit 4351b40
+- [x] @! TID[epic=Rv1.1.8-i0/docs.pltf-impl] DOCS-014 <+ Bổ sung tài liệu thiết kế pipeline TSD/TLC với vị trí thiết kế và chiến lược kiểm thử trong `docs/review/pltf-impl.md`. //REF - commit cbfadf1
+- [x] @! TID[epic=Rv1.1.8-i0/docs.pltf-impl] DOCS-015 <+ Cập nhật mục review với các vấn đề đã obsolete và thông tin tích hợp libunity cho TSD/TLC trong `docs/review/pltf-impl.md` và `docs/vni/pltf-design.md`. //REF - commit a9efd4f
 
 <!-- NOTE
 4 ticket từ DOCS-009 đến DOCS-012 được thêm trước nhằm chuẩn bị cho các changes trên branch sub-feat/Rv1.1.7-bf1 chưa submodulize. 
