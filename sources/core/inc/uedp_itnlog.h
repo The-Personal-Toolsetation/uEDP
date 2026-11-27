@@ -62,7 +62,7 @@
   typedef struct uedp_itnlog_entry_t {
     ui16 task_id;
     ui16 msg_sig;
-    ui16 tmstmp;
+    ui32 tmstmp;
     ui16 hash; 
     const char* msg;
     const char* tag;

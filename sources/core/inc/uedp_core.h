@@ -207,7 +207,15 @@
    */
 
   #ifndef UEDP_ITNLOG_FLUSH_THRESHOLD
-    #define UEDP_ITNLOG_FLUSH_THRESHOLD  (28u) // units, ngưỡng để tự động flush log entry ra đích đến khi số lượng log entry trong ring buffer đạt đến ngưỡng này
+    #define UEDP_ITNLOG_FLUSH_THRESHOLD  (28u) // units, ngưỡng để yêu cầu OCE flush log entry khi số lượng log entry trong ring buffer đạt đến ngưỡng này
+  #endif
+
+  #ifndef UEDP_ITNLOG_MSG_MAX_LEN
+    #define UEDP_ITNLOG_MSG_MAX_LEN  (64u) // bytes, kể cả ký tự kết thúc chuỗi; msg dài hơn sẽ bị cắt khi copy vào log
+  #endif
+
+  #ifndef UEDP_ITNLOG_TAG_MAX_LEN
+    #define UEDP_ITNLOG_TAG_MAX_LEN  (8u) // bytes, kể cả ký tự kết thúc chuỗi
   #endif
 
   /* ============================================================================
