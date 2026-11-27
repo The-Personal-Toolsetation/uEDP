@@ -510,7 +510,7 @@ git checkout <target-branch>
 git status
 ```
 
-The superproject should not contain unrelated modifications.
+The superproject should not contain unrelated modifications. It should only return the warning about the tracked `pltf/*` files which prevent the operation. If other changes exist, stash or commit them first.
 
 Check the current `pltf` representation:
 
@@ -519,10 +519,10 @@ git ls-tree HEAD -- pltf
 git ls-files --stage "pltf/*"
 ```
 
-Before migration, the expected state is a normal tree/files, for example:
+Before migration, the expected state is a normal gitlink, for example:
 
 ```text
-040000 tree <tree-sha>    pltf
+160000 commit <commit-sha>    pltf
 ```
 
 and individual index entries such as:
@@ -530,12 +530,6 @@ and individual index entries such as:
 ```text
 100644 <blob-sha> 0    pltf/README.md
 100644 <blob-sha> 0    pltf/uedp.py
-```
-
-Do **not** run `git submodule add ... pltf` while these files are still tracked. Otherwise Git may report:
-
-```text
-fatal: 'pltf' already exists in the index
 ```
 
 #### 14.4.2. Confirm the PLTF revision before conversion
@@ -605,7 +599,11 @@ git -C pltf checkout <PLTF_COMMIT>
 git -C pltf rev-parse HEAD
 ```
 
-A detached HEAD is acceptable here because this is only selecting the pin. Do not develop or create new PLTF commits while detached.
+A detached HEAD is acceptable here because this is only selecting the pin. Do not develop or create new PLTF commits while detached. Creating branch is acceptable due to the fact that gitsp now requires both branch and commit to be used for submodule pinning. Therefore, it is recommended to create a branch for the selected commit after adding the submodule. For example:
+
+```bash
+git -C pltf checkout -b <BRANCH_NAME> <PLTF_COMMIT>
+```
 
 Stage the submodule metadata:
 
@@ -665,7 +663,7 @@ delete mode 100644 pltf/README.md
 ...
 ```
 
-Do **not** restore those deleted `100644` entries after the conversion. They are intentionally replaced by the `160000` gitlink.
+Do **not** restore those deleted `100644` entries after the conversion. They are intentionally replaced by the `160000` gitlink. After the commit, the long red line of deleted files is disappearing from the superproject history, but the files still exist in the PLTF repository because now it is a submodule.
 
 Conceptually:
 
@@ -1295,3 +1293,11 @@ When current development intersected with multiple release and bugfix. It is imp
 The following rules are proposed:
 
 - Ticket is allowed to be created and placed on any release space on task list counting for the current development. However, it is important to keep track of the ticket record for each release space using epic tag. For example, if a ticket is created for v1.1.8, it should be tagged with `epic=Rv1.1.8-i0` to indicate that it belongs to the v1.1.8 release space. `epic=Rv1.1.7-bf1` is used to indicate that the ticket belongs to the v1.1.7-bf1 but it is acceptable if the ticket is created for >= v1.1.8 development but it is important to keep track of the ticket record for each release space using epic tag.
+
+## 16. `fix` of 3
+
+When current development intersected with multiple release and bugfix, it is important to keep track of the `fix` of old release and `fix` of current release. The following rules are proposed:
+
+- `fix` branch is only allowed for current development release. For example, if current development is v1.1.8, `fix` branch is only allowed for v1.1.8 but not for v1.1.7-bf1 or v1.1.9.
+- `fix` type commit is allowed to used only for bugfix of former release but not for current development release. For example, if current development is v1.1.8, `fix` type commit is only allowed for former release v1.1.7-bf1 but not for current development release v1.1.8 or future release v1.1.9.
+- Fix changes from former release is considered to be allowed to merge into the `fix` branch of current development release. For example, if current development is v1.1.8, `fix` changes from former release v1.1.7-bf1 is considered to be allowed to merge into the `fix` branch of current development release v1.1.8 but not for future release v1.1.9.
