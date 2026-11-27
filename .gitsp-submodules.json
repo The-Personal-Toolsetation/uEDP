@@ -1,5 +1,8 @@
 {
   "doc": {
     "pltf": "main"
+  },
+  "sub-feat/Rv1.1.8": {
+    "pltf": "main"
   }
 }
