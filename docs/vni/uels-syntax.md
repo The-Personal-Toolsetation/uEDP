@@ -184,7 +184,7 @@ Cần rewrite lại phần này tương ứng với các khối phát triển đ
 
 1. Đọc phần quy ước YAML trước để tránh lỗi thụt lề và kiểu dữ liệu.
 2. Đọc phần Task để hiểu `tlist`, `task`, `tsm`, `fsm`, `exec` và `steps`.
-3. Đọc SII, PPLP, APE, OCE để nắm các block mở rộng bám trực tiếp vào core API.
+3. Đọc SII, PPLP, OCE để nắm các block mở rộng bám trực tiếp vào core API.
 4. Xem ví dụ tổng hợp ở cuối tài liệu nếu muốn viết cấu hình đầu tiên thật nhanh.
 
 ### Bản đồ syntax -> core
@@ -377,9 +377,9 @@ Trong thiết kế thì PPLP có cấu hình riêng biệt với process-syntax 
 -->
 
 <!-- DEPRECATED - Old TASK
-Cân nhắc đưa lộ trình hỗ trợ PPLP vào roadmap của μE-LS ở phiên bản 1.1.7/1.1.8 cùng với APE.
+Cân nhắc đưa lộ trình hỗ trợ PPLP vào roadmap của μE-LS ở phiên bản 1.1.7/1.1.8.
 
-# STATUS - Đã chính thức đưa PPLP vào roadmap của μE-LS ở phiên bản 1.1.7/1.1.8, còn đối với APE thì có thể loại bỏ do c_call và c_stmt đã có thể gọi trực tiếp các hàm vượt quyền tạm thời trong core API.
+# STATUS - Đã chính thức đưa PPLP vào roadmap của μE-LS ở phiên bản 1.1.7/1.1.8.
 -->
 
 PPLP khai báo chính sách logging cho Core và backend xuất log. Trong runtime, `itnlog` chỉ giữ filter và callback output; việc flush ra console, UART hoặc file nên đi qua OCE hoặc callback đã đăng ký.
@@ -458,131 +458,11 @@ Loại bỏ toàn bộ cú pháp ISR vì bản thân `process-syntax` đã có t
 #STATUS - DONE
 -->
 
-### APE - Lời gọi vượt quyền tạm thời
+### ~~APE~~ - Đã loại bỏ
 
-<!-- DEPRECATED - Old TASK
-Loại bỏ toàn bộ cú pháp ISR vì bản thân `process-syntax` đã có thể xử lý syntax C-type với `actv: c_stmt` hoặc `actv: c_call`.
--->
+APE (Atomic Priority Escalation) không còn là cú pháp của μE-LS. Lý do: `c_call` và `c_stmt` đã có thể gọi trực tiếp `uedp_task_norm_set_urgent(tid)` và `uedp_task_norm_post_urgent(tid, msg)` trong core API, và `set_urgent` tự chọn mức ưu tiên tạm thời nên không cần khai báo thêm trong YAML. Các khối `escal`, `mode: slnf`, `mode: non-slnf` và `post_urgent` không còn được hỗ trợ.
 
-<!-- REVIEW
-Trong thiết kế lõi, chưa tính đến trường hợp `tnorm` gọi APE trong TSM hoặc out-context của `tsm_dispatch()` và cả `pycdscriptor` chưa hỗ trợ sinh code cho APE. 
-Do đó, cần review lại tính cần thiết của syntax này với use-case sử dụng trên API C-type gốc trước khi quyết định giữ lại hay loại bỏ hoàn toàn.
--->
-
-<!-- STATUS - IN-PROGRESS
-Đề xuất thiết kế mới cho APE như sau:
-
-1. Giữ lại cú pháp APE trong μE-LS nhưng đưa level của syntax lên mức toàn cục cho tác vụ, nghĩa là trước khi bất kỳ logic nào được thực thi, bao gồm cả `tsm`, `fsm` và `exec`, APE sẽ được đăng ký trigger và tác động trước như một interferencer bảo vệ logic lẫn quyền ưu tiên.
-2. Cho phép APE trong actv-obj của logic `tsm`, `fsm` và `exec`, nghĩa là người dùng có thể sử dụng với `c_call` và `c_stmt` để gọi APE cho chính mình hoặc cho các tnorm khác, miễn là không bị báo lỗi.
--->
-
-<!-- DEPRECATED - Old TASK
-Cân nhắc đưa lộ trình hỗ trợ APE vào roadmap của μE-LS ở phiên bản 1.1.7/1.1.8.
-
-# STATUS - Đã loại bỏ APE khỏi roadmap của μE-LS ở phiên bản 1.1.7/1.1.8, do c_call và c_stmt đã có thể gọi trực tiếp các hàm vượt quyền tạm thời trong core API.
--->
-
-APE hay S-LnF APE là cơ chế được triển khai ở phiên bản 1.1.0 và 1.1.1 để hỗ trợ tnorm có thể gọi các hàm vượt quyền tạm thời (Privilege Escalation) trong môi trường μE(DP)/-OS. Trong μE-LS, APE là khai báo cục bộ theo từng tnorm: mỗi task có thể tự định nghĩa trigger APE cho chính nó, và Core chỉ cung cấp cơ chế thực thi tương ứng qua `uedp_task_norm_post_urgent()` và `uedp_task_norm_set_urgent()`.
-
-Cú pháp khai báo APE trong μE-LS được hỗ trợ chỉ dành cho tnorm nên sẽ không có phần khai báo riêng cho tpoll. Một tnorm có thể đặt APE ngang hàng với `tsm`, `fsm` hoặc `exec`, hoặc đưa vào `actv` như một action để tự kích hoạt APE cho chính nó.
-
-```yaml
-escal:
-  mode: slnf
-  trigger:
-  - on_sig: SIG_CALL_URGENT # Kích hoạt APE khi nhận signal này
-    post_urgent: # Tự gọi urgent message cho chính tnorm để thực thi hành vi ưu tiên
-      to: KID_TASK_USR
-      sig: SIG_EXEC_URGENT
-      data: NULL
-```
-
-`post_urgent` tương ứng trực tiếp với `uedp_task_norm_post_urgent()`: message được đẩy vào đầu queue, còn priority escalation được core xử lý bằng `uedp_task_norm_set_urgent()`. Vì APE là local cho từng tnorm, chính tnorm đó phải chịu trách nhiệm xử lý trigger và quyết định khi nào tự tăng ưu tiên cho chính mình.
-
-Ngoài ra, do API hiện tại chưa triển khai restriction policy nên 1 tnorm có thể gọi APE cho chính nó hoặc cho các tnorm khác, miễn là các tnorm đó đã được khai báo APE trong μE-LS. Tuy nhiên, việc gọi APE cho tnorm khác nên được hạn chế để tránh các vấn đề về đồng bộ hóa và ưu tiên xử lý.
-
-Với `mode: non-slnf`, core không cần self-post một message khẩn cấp. Thay vào đó, tnorm được cho phép chạy thêm đúng một vòng nữa theo thứ tự message queue sẵn có của chính nó, rồi mới quay lại trạng thái bình thường. Cách này phù hợp khi người dùng cần ưu tiên xử lý ngữ cảnh hiện tại mà không muốn thay đổi thứ tự queue bằng một urgent message mới.
-
-```yaml
-escal:
-  mode: non-slnf
-  trigger:
-  - on_sig: SIG_CALL_IO_BOOST # Kích hoạt APE khi nhận signal này
-    post_urgent: NULL # Không cần tự gửi urgent message mới
-  - on_sig: SIG_URGENT_NEXT # Kích hoạt APE khi nhận signal này
-    post_urgent: NULL # Không cần tự gửi urgent message mới
-```
-
-<!-- REVIEW
-Trong thiết kế API C-type hiện tại, `uedp_task_norm_post_urgent` chỉ hỗ trợ gửi non-data urgent message,
-do đó, `post_urgent` trong μE-LS cũng chỉ hỗ trợ gửi urgent message không kèm dữ liệu và giữ nguyên style actv-obj-post của actv-obj cũ trên process-syntax.
--->
-
-Ví dụ:
-
-```yaml
-project: "uEDP"
-tlist:
-- tnorm: KID_TASK_USR
-  exec:
-    - on_sig: SIG_CALL_URGENT
-      steps:
-        - actv:
-            kind: c_stmt
-            code: |
-              // Logic xử lý khi nhận SIG_CALL_URGENT
-              printf("[Task USR] Received SIG_CALL_URGENT, preparing to escalate.\n");
-    - on_sig: SIG_EXEC_URGENT
-      steps:
-        - actv: 
-            kind: c_call
-            function: printf
-            args: ['"[Task USR] Executing urgent action after escalation."']
-  escal:
-    mode: slnf
-    trigger:
-      - on_sig: SIG_CALL_URGENT # Kích hoạt APE khi nhận signal này
-        post_urgent:
-          to: KID_TASK_USR
-          sig: SIG_EXEC_URGENT
-          data: NULL
-      - on_sig: SIG_URGENT_NEXT # Kích hoạt APE khi nhận signal này
-        post_urgent:
-          to: KID_TASK_USR
-          sig: SIG_EXEC_URGENT
-          data: NULL
-- tnorm: KID_TASK_IO
-  exec:
-  - on_sig: SIG_CALL_IO_BOOST
-    steps:
-      - actv: 
-          kind: c_stmt
-          code: |
-            // Logic xử lý khi nhận SIG_CALL_IO_BOOST
-            printf("[Task IO] Received SIG_CALL_IO_BOOST, preparing to boost IO.\n");
-  - on_sig: SIG_EXEC_IO_BOOST
-    steps:
-      - actv: 
-          kind: c_call
-          function: printf
-          args: ['"[Task IO] Executing IO boost action after escalation."']
-  escal:
-    mode: non-slnf
-    trigger:
-      - on_sig: SIG_CALL_IO_BOOST # Kích hoạt APE khi nhận signal này
-        post_urgent: NULL # Không cần tự gửi urgent message mới
-      - on_sig: SIG_URGENT_NEXT # Kích hoạt APE khi nhận signal này
-        post_urgent: NULL # Không cần tự gửi urgent message mới
-```
-
-Khi dùng `mode: non-slnf`, tnorm không bắt buộc phải tự gửi một urgent message mới. Mục đích là cho phép chính task đó giữ nhịp xử lý thêm một vòng với queue hiện có trước khi hoàn trả vòng làm việc về cho các task khác, nên trigger thường chỉ cần là một signal nội bộ hoặc một action local do cùng task phát ra. Nếu có urgent message mới, nó sẽ được xử lý theo thứ tự FIFO bình thường, không phải ưu tiên.
-
-> Thống nhất cú pháp
-> `trigger` ở cả 2 mode được xem xét làm một danh sách các trigger, mỗi trigger có thể là một signal hoặc một action. Khi trigger được kích hoạt, nếu `post_urgent` không NULL thì sẽ gửi urgent message mới; nếu NULL thì task sẽ tiếp tục xử lý queue hiện tại thêm một vòng nữa.
-
-<!-- DEPRECATED - Old TASK
-Cân nhắc loại bỏ toàn bộ cú pháp ISR vì bản thân `process-syntax` đã có thể xử lý syntax C-type với `actv: c_stmt` hoặc `actv: c_call`.
--->
+Cơ chế urgent vẫn tồn tại trong core, xem [arch-design.md](./arch-design.md) mục tăng ưu tiên tạm thời.
 
 ### PSE - Pub-Sub Engine
 
