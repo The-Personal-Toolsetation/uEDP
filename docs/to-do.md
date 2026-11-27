@@ -772,6 +772,16 @@ Hiện tại đối với các ticket PLTF-014 >> 016 thì sẽ cân nhắc đư
 - [ ] @! TID[epic=Rv1.1.8-i0/version-control-policy] REPO-004 <+ Cập nhật bổ sung các thay đổi của ticket allocation từ v1.1.8 sang v1.2.0
 - [x] @! TID[epic=Rv1.1.8-i0/pltf.submodulize] REPO-005 <+ Phân tách và module hóa pltf thành submodule để quản lý và phát triển các tính năng của PLTF một cách hiệu quả và ổn định.
 - [x] @! TID[epic=Rv1.1.8-i0/pltf.submodulize] DOCS-008 <+ Bổ sung policy cho việc quản lý submodule trong PLTF, bao gồm các quy tắc về cách thức phân tách, quản lý và phát triển các submodule một cách hiệu quả và ổn định.
+- [x] @! TID[epic=Rv1.1.7-bf1/docs] DOCS-009 <+ Hiệu chỉnh tài liệu `arch-design` (VN/EN) về cơ chế logging và làm rõ tích hợp OCE service trong việc lập lịch task. //REF - commit 61aee7f
+- [x] @! TID[epic=Rv1.1.7-bf1/docs] DOCS-010 <+ Bổ sung chi tiết quản lý độ ưu tiên task và logging trong `user-manual` (VN/EN). //REF - commit 010ff39
+- [x] @! TID[epic=Rv1.1.7-bf1/docs] DOCS-011 <+ Cập nhật tham chiếu và loại bỏ cú pháp APE đã deprecated trong `docs/vni/uels-syntax.md`. //REF - commit c60e550
+- [x] @! TID[epic=Rv1.1.7-bf1/docs] DOCS-012 <+ Làm rõ mô tả tính năng APE cho xử lý task khẩn cấp trong `README.md`. //REF - commit 2f88560
+
+<!-- NOTE
+4 ticket từ DOCS-009 đến DOCS-012 được thêm trước nhằm chuẩn bị cho các changes trên branch sub-feat/Rv1.1.7-bf1 chưa submodulize. 
+
+Việc bổ sung 4 ticket đã hoàn thành nhằm lưu record cho các changes. Ngoài ra, việc set các bugfix ticket cũng sẽ được cập nhật bổ sung vào policy quản lý.
+-->
 
 //  !SECTION
 
