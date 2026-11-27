@@ -298,7 +298,12 @@ These APIs are especially useful for itnlog, since the logger obtains `task_id` 
 
 #### Temporarily raising priority
 
-After finishing a message, or when called by an ISR to raise its priority, a task can temporarily raise its priority using `uedp_task_norm_set_urgent(task_id_t tid)` and `uedp_task_norm_post_urgent(task_id_t tid, uedp_msg_t* msg)`. The scheduler uses this priority level for the next scheduling round. Once the task has no more messages left in its queue, the priority automatically resets back to `base_pri`.
+After finishing a message, or when called by an ISR to raise its priority, a task can temporarily raise its priority using `uedp_task_norm_set_urgent(task_id_t tid)` or `uedp_task_norm_post_urgent(task_id_t tid, uedp_msg_t* msg)`.
+
+- `uedp_task_norm_set_urgent(tid)` automatically picks the lowest free escalation level in `UEDP_TASK_PRI_LEVEL_16`..`UEDP_TASK_PRI_LEVEL_23` and assigns it to the task. The caller does not pass a priority value. If no escalation level is free, the task is marked `urgent_pending`, `UEDP_FCR_TASK_PRI_EXHAUSTED` (WARN) is raised, and the scheduler retries on a later round.
+- `uedp_task_norm_post_urgent(tid, msg)` puts the message at the head of the task's queue and then calls `uedp_task_norm_set_urgent(tid)`.
+
+The scheduler uses the escalated level for the next scheduling round. After the task has processed its urgent work, its priority is restored to `base_pri`.
 
 ### ISR
 
@@ -377,7 +382,7 @@ Itnlog is μEDP's internal logging mechanism, used to replace scattered `printf`
 1. Call `uedp_itnlog_init()` after initializing the Core and before starting the scheduler.
 2. Register a log output wrapper using `uedp_itnlog_set_output()`.
 3. Call `uedp_itnlog_log()` wherever an event needs to be recorded.
-4. Call `uedp_itnlog_dump()` when you want to print all the log currently held in the buffer.
+4. Output is produced by `uedp_itnlog_dump()`, which runs in the OCE service that `uedp_itnlog_init()` registers. The application does not call `uedp_itnlog_dump()` from the scheduler loop.
 
 Example configuration on Linux:
 
@@ -399,12 +404,11 @@ int main(void) {
   while (1) {
     uedp_task_scheduler();
     usleep(100);
-    uedp_itnlog_dump();
   }
 }
 ```
 
-When writing application code, instead of inserting `printf` directly in a handler, call `uedp_itnlog_log()` with an appropriate tag such as `TSK`, `MSG`, `FSM`, `TSM`, or `TIM`. Then call `uedp_itnlog_dump()` whenever you want to flush the entire log buffer to the configured output.
+When writing application code, instead of inserting `printf` directly in a handler, call `uedp_itnlog_log()` with an appropriate tag such as `TSK`, `MSG`, `FSM`, `TSM`, or `TIM`. The OCE service flushes the buffer to the configured output when the system is idle.
 
 Important note: `uedp_itnlog_set_output()` accepts a function with the signature `void (*)(const char*)`. Therefore, do not pass `printf` directly into this API; instead, wrap `printf` or `fputs` in a wrapper as shown in the example above.
 
@@ -416,11 +420,13 @@ When dumping, each entry is assembled into a line following a template, or accor
 [ITNLOG] tmstmp task_id msg_id msg
 ```
 
-Here, `task_id` and `msg_id` are printed in hex form to make it easy to map to the Core's internal IDs. `msg_id` is the `msg_sig` of the current message at the time the log was written. Example:
+Here, `tmstmp` is a `ui32` value printed with `%lu` and without a unit suffix. `task_id` and `msg_id` are printed in hex form to make it easy to map to the Core's internal IDs. `msg_id` is the `msg_sig` of the current message at the time the log was written. Example:
 
 ```text
 [ITNLOG] 0 0xE4 0x01 System is alive and running...
 ```
+
+If the ring buffer was full and entries were dropped, the next dump prints `[ITNLOG] dropped N` before the remaining entries.
 
 #### Filtering by tag
 
@@ -435,9 +441,11 @@ Notes:
 #### Debugging notes
 
 - If logs are not appearing immediately on the terminal, check whether the output callback flushes `stdout`.
-- If you want to print logs at a specific point in time, you can call `uedp_itnlog_dump()` inside a polling task or right before a test case ends.
-- `uedp_itnlog_log()` only writes into the internal buffer; actual display depends on the output callback and when the dump happens.
-- If the log buffer is full, `uedp_itnlog_log()` will make the logger auto-dump before writing the next entry, per the current design in the source.
+- `uedp_itnlog_log()` copies `msg` and `tag` into the logger's own storage, so the caller does not need to keep those strings alive. Strings longer than `UEDP_ITNLOG_MSG_MAX_LEN` or `UEDP_ITNLOG_TAG_MAX_LEN` are truncated.
+- `uedp_itnlog_log()` only writes into the internal buffer; actual display depends on the output callback and when the OCE dump runs.
+- When the number of buffered entries reaches `UEDP_ITNLOG_FLUSH_THRESHOLD`, the logger requests a flush from the OCE service. It does not dump inside the logging call.
+- If the ring buffer is full and OCE has not drained it yet, the new entry is dropped and counted. The next dump prints `[ITNLOG] dropped N`.
+- `uedp_itnlog_clear()` returns an entry whose `msg` and `tag` pointers refer to the logger's internal storage. They stay valid until the next dump.
 
 ### Logdp, Rprintf, and Xprintf
 
@@ -495,7 +503,6 @@ int main(void) {
 
   while (1) {
     uedp_task_scheduler();
-    uedp_itnlog_dump();
   }
 }
 ```

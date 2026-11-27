@@ -307,7 +307,12 @@ Các API này đặc biệt hữu ích cho itnlog vì logger lấy `task_id` và
 
 #### Tăng ưu tiên tạm thời
 
-Sau khi xử lý xong 1 message hoặc được ISR gọi tăng mức ưu tiên, task có thể tăng ưu tiên tạm thời bằng `uedp_task_norm_set_urgent(task_id_t tid)` và `uedp_task_norm_post_urgent(task_id_t tid, uedp_msg_t* msg)`. Scheduler sẽ dùng mức ưu tiên này cho vòng lập lịch tiếp theo. Khi task không còn message nào trong queue, mức ưu tiên sẽ tự reset về `base_pri`.
+Sau khi xử lý xong 1 message hoặc được ISR gọi tăng mức ưu tiên, task có thể tăng ưu tiên tạm thời bằng `uedp_task_norm_set_urgent(task_id_t tid)` hoặc `uedp_task_norm_post_urgent(task_id_t tid, uedp_msg_t* msg)`.
+
+- `uedp_task_norm_set_urgent(tid)` tự động chọn mức ưu tiên tạm thời trống thấp nhất trong dải `UEDP_TASK_PRI_LEVEL_16`..`UEDP_TASK_PRI_LEVEL_23` và gán cho task. Người gọi không truyền giá trị ưu tiên. Nếu không còn mức tạm thời nào trống, task được đánh dấu `urgent_pending`, raise `UEDP_FCR_TASK_PRI_EXHAUSTED` (WARN), và scheduler sẽ thử lại ở vòng sau.
+- `uedp_task_norm_post_urgent(tid, msg)` đưa message vào đầu hàng đợi của task, sau đó gọi `uedp_task_norm_set_urgent(tid)`.
+
+Scheduler dùng mức ưu tiên tạm thời cho vòng lập lịch tiếp theo. Sau khi task xử lý xong công việc khẩn, mức ưu tiên được hoàn lại `base_pri`.
 
 ### ISR
 
@@ -390,7 +395,7 @@ Itnlog là cơ chế logging nội bộ của μEDP, được dùng để thay t
 1. Gọi `uedp_itnlog_init()` sau khi đã khởi tạo Core và trước khi bắt đầu chạy scheduler.
 2. Đăng ký một wrapper xuất log bằng `uedp_itnlog_set_output()`.
 3. Gọi `uedp_itnlog_log()` ở nơi cần ghi nhận sự kiện.
-4. Gọi `uedp_itnlog_dump()` khi muốn in toàn bộ log đang có trong bộ đệm.
+4. Việc xuất log do `uedp_itnlog_dump()` thực hiện, và hàm này chạy trong OCE service mà `uedp_itnlog_init()` đăng ký. Ứng dụng không gọi `uedp_itnlog_dump()` từ vòng lặp scheduler.
 
 Ví dụ cấu hình trên Linux:
 
@@ -412,12 +417,11 @@ int main(void) {
   while (1) {
     uedp_task_scheduler();
     usleep(100);
-    uedp_itnlog_dump();
   }
 }
 ```
 
-Khi viết code ứng dụng, thay vì chèn `printf` trực tiếp trong handler, nên gọi `uedp_itnlog_log()` với một tag phù hợp như `TSK`, `MSG`, `FSM`, `TSM` hoặc `TIM`. Sau đó dùng `uedp_itnlog_dump()` ở thời điểm muốn xuất toàn bộ buffer log ra đích đã cấu hình.
+Khi viết code ứng dụng, thay vì chèn `printf` trực tiếp trong handler, nên gọi `uedp_itnlog_log()` với một tag phù hợp như `TSK`, `MSG`, `FSM`, `TSM` hoặc `TIM`. OCE service sẽ xuất buffer log ra đích đã cấu hình khi hệ thống rảnh.
 
 Lưu ý quan trọng:
 
@@ -433,11 +437,13 @@ Khi dump, mỗi entry được ghép thành một dòng theo mẫu hoặc tùy t
 [ITNLOG] tmstmp task_id msg_id msg
 ```
 
-Trong đó `task_id` và `msg_id` được xuất ở dạng hex để dễ map với ID nội bộ của Core. `msg_id` chính là `msg_sig` của message hiện tại khi log được ghi. Ví dụ:
+Trong đó `tmstmp` là giá trị `ui32` được in bằng `%lu`, không kèm hậu tố đơn vị. `task_id` và `msg_id` được xuất ở dạng hex để dễ map với ID nội bộ của Core. `msg_id` chính là `msg_sig` của message hiện tại khi log được ghi. Ví dụ:
 
 ```text
 [ITNLOG] 0 0xE4 0x01 System is alive and running...
 ```
+
+Nếu ring buffer đã đầy và có entry bị bỏ, lần dump tiếp theo in dòng `[ITNLOG] dropped N` trước các entry còn lại.
 
 #### Lọc theo tag
 
@@ -452,9 +458,11 @@ Lưu ý khi sử dụng lọc:
 #### Lưu ý khi debug
 
 - Nếu log chưa hiện ngay trên terminal, kiểm tra callback output có flush `stdout` hay không.
-- Nếu muốn in log theo thời điểm nhất định, có thể gọi `uedp_itnlog_dump()` trong polling task, OCE service hoặc ngay trước khi kết thúc testcase.
-- `uedp_itnlog_log()` chỉ ghi vào bộ đệm nội bộ, còn việc hiển thị phụ thuộc vào callback output và thời điểm dump.
-- Nếu buffer log đầy, `uedp_itnlog_log()` sẽ làm logger tự dump trước khi ghi tiếp theo thiết kế hiện tại trong source.
+- `uedp_itnlog_log()` tự copy `msg` và `tag` vào bộ nhớ nội bộ của logger, nên người gọi không cần giữ chuỗi sống lâu. Chuỗi dài hơn `UEDP_ITNLOG_MSG_MAX_LEN` hoặc `UEDP_ITNLOG_TAG_MAX_LEN` sẽ bị cắt bớt.
+- `uedp_itnlog_log()` chỉ ghi vào bộ đệm nội bộ, còn việc hiển thị phụ thuộc vào callback output và thời điểm OCE dump.
+- Khi số entry trong bộ đệm đạt `UEDP_ITNLOG_FLUSH_THRESHOLD`, logger yêu cầu OCE service flush. Logger không dump bên trong lời gọi log.
+- Nếu ring buffer đầy mà OCE chưa kịp rút, entry mới bị bỏ và được đếm. Lần dump tiếp theo in `[ITNLOG] dropped N`.
+- `uedp_itnlog_clear()` trả về entry có con trỏ `msg` và `tag` trỏ vào bộ nhớ nội bộ của logger. Các con trỏ này hợp lệ đến lần dump tiếp theo.
 
 ### Logdp, Rprintf và Xprintf
 
@@ -512,7 +520,6 @@ int main(void) {
 
   while (1) {
     uedp_task_scheduler();
-    uedp_itnlog_dump();
   }
 }
 ```
