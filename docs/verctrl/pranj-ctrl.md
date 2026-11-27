@@ -1287,3 +1287,11 @@ PLTF repository owns:
 ```
 
 Once all relevant branches follow this structure, normal switching and merging no longer requires deleting and restoring dozens of `pltf` files. The superproject changes only the pin, while the submodule repository remains responsible for its own source and history.
+
+## 15. Ticket record againt multiple release
+
+When current development intersected with multiple release and bugfix. It is important to keep track of the ticket record.
+
+The following rules are proposed:
+
+- Ticket is allowed to be created and placed on any release space on task list counting for the current development. However, it is important to keep track of the ticket record for each release space using epic tag. For example, if a ticket is created for v1.1.8, it should be tagged with `epic=Rv1.1.8-i0` to indicate that it belongs to the v1.1.8 release space. `epic=Rv1.1.7-bf1` is used to indicate that the ticket belongs to the v1.1.7-bf1 but it is acceptable if the ticket is created for >= v1.1.8 development but it is important to keep track of the ticket record for each release space using epic tag.
