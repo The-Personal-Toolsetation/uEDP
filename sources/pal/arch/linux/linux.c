@@ -17,6 +17,7 @@
 #include "uedp_msg.h"
 #include "uedp_timer.h"
 #include "uedp_itnlog.h"
+#include "uedp_ocesvc.h"
 #include "uedp_fcr.h"
 
 //ANCHOR - Khai báo thư viện encrypt
@@ -51,6 +52,7 @@ void uedp_core_init(void) {
   pal_core_init();
   uedp_msg_pool_init();
   uedp_timer_init();
+  ocesvc_ctrl_init();
   uedp_itnlog_init();
   internal_create_tick_thread();
 }
