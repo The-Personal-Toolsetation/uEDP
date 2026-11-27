@@ -69,6 +69,13 @@
    */
   void ocesvc_unregister(ocesvc_t* svc);
 
+  /** ANCHOR - Hàm đặt lại trạng thái READY cho dịch vụ OCE đã đăng ký
+   * @param svc Con trỏ đến dịch vụ OCE cần chạy lại
+   * @note Dùng khi tác vụ norm hoặc chính handler OCE cần dịch vụ chạy lại ở lượt rảnh kế tiếp.
+   *       Nếu gọi trong lúc handler đang chạy, trạng thái READY được giữ lại sau khi handler kết thúc.
+   */
+  void ocesvc_set_ready(ocesvc_t* svc);
+
   /** ANCHOR - Hàm thực thi dịch vụ OCE theo cơ chế FCFS
    */
   void ocesvc_scheduler();

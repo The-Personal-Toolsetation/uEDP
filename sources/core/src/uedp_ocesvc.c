@@ -74,23 +74,40 @@ void ocesvc_unregister(ocesvc_t* svc) {
   }
 }
 
+void ocesvc_set_ready(ocesvc_t* svc) {
+  if (svc == NULL) {
+    UEDP_FCR_RAISE_MSG(UEDP_FCR_OCE_INVALID_SVC, "set_ready: null svc");
+    return;
+  }
+
+  if (svc == &head) {
+    UEDP_FCR_RAISE_MSG(UEDP_FCR_OCE_INVALID_SVC, "set_ready: svc is sentinel head");
+    return;
+  }
+
+  if (svc->state == OCESVC_STATE_IDLE) {
+    return; // Dịch vụ chưa được đăng ký
+  }
+
+  svc->state = OCESVC_STATE_READY;
+}
+
 void ocesvc_scheduler() {
-  // Lấy head của danh sách liên kết đơn và duyệt qua từng dịch vụ OCE
   llist_node_t* current = ocesvc_list.head;
   if (current == NULL) {
-    //NOTE - Minh: Chỉ xảy ra nếu gọi trước ocesvc_ctrl_init() - hiếm gặp, không cần raise FCR ở hot-path.
-    //FIXME - Sang: Chỗ này vẫn cần raise với message để đảm bảo cover. -done
     UEDP_FCR_RAISE_MSG(UEDP_FCR_OCE_NOT_INIT, "scheduler: list is null before init");
-    return; // Nếu danh sách rỗng, không làm gì cả
+    return;
   }
-  // Chỉ service đầu tiên trong danh sách có trạng thái READY mới được thực thi
+
   while (current != NULL) {
     ocesvc_t* svc = (ocesvc_t*)current->data;
     if (svc != NULL && svc->state == OCESVC_STATE_READY && svc->handler != NULL) {
       svc->state = OCESVC_STATE_RUNNING;
       svc->handler(svc);
-      // Sau khi thực thi xong, chuyển trạng thái sang COMPLETED
-      svc->state = OCESVC_STATE_COMPLETED;
+      // Handler có thể đã gọi ocesvc_set_ready() và đặt lại READY; chỉ hoàn tất khi vẫn đang RUNNING
+      if (svc->state == OCESVC_STATE_RUNNING) {
+        svc->state = OCESVC_STATE_COMPLETED;
+      }
       return;
     }
     current = current->next;
