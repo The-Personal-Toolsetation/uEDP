@@ -4,5 +4,11 @@
       "branch": "snap/Rv1.1.7",
       "commit": "d48690a4d40be29a9cff624dab90c83c9468630d"
     }
+  },
+  "sub-feat/Rv1.1.8": {
+    "pltf": {
+      "branch": "main",
+      "commit": "24604bff6e9e7de1711304557960a20cb45f6768"
+    }
   }
 }
