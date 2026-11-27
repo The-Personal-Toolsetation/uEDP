@@ -28,6 +28,7 @@ Chỉ số (INDEX) là một số nguyên duy nhất để phân biệt các Tas
 5. `[NETW - XXX]` dành cho các tác vụ liên quan đến mạng, bao gồm các tác vụ như cấu hình mạng, kiểm tra kết nối, và các tác vụ khác liên quan đến mạng.
 6. `[REPO - XXX]` dành cho các tác vụ liên quan đến kho lưu trữ mã nguồn, bao gồm các tác vụ như quản lý nhánh, hợp nhất mã nguồn, và các tác vụ khác liên quan đến kho lưu trữ.
 7. `[ARCH - XXX]` dành cho các tác vụ liên quan đến bổ sung support cho PAL.
+8. `[TOOL - XXX]` dành cho các tác vụ liên quan đến công cụ hỗ trợ quy trình phát triển, bao gồm gitsp, quản lý ticket, các script điều khiển và sinh/chạy kiểm thử.
 
 ## Directive cho Comment Anchors
 
