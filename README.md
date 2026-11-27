@@ -24,7 +24,7 @@ Feel free to star the projetct and contribute to its development. Your support i
 
 - **[SAD]** Separate Architecture Design: Clear layering between App Layer — μEDP Framework — PAL (Platform Abstraction Layer).
 - **[PSP]** Priority Scheduling Policy: Priority-based multitasking scheduling using bitmasks, optimizing response time for events.
-- **[APE]** Safe LIFO-nested FIFO Atomic Priority Escalation : Support for temporary priority escalation for urgent tasks, ensuring critical events are handled promptly without preemption issues using S-LnF (Safe LIFO-nested FIFO) mechanism.
+- **[APE]** Safe LIFO-nested FIFO urgent handling with automatic temporary priority escalation: `uedp_task_norm_set_urgent(tid)` selects a free escalation level (16-23) by itself, so urgent tasks are handled promptly without a caller-managed priority.
 - **[DMP]** Deterministic Memory Pooling: Minimizing fragmentation and ensuring deterministic behavior for real-time systems with automatic atomic void size scaling of memory pools.
 - **[D2MP]** Data-to-Message Passing : Support for passing values and references (zero-copy), automatically adapting to 32/64-bit pointer sizes.
 - **[HSMC]** Hybrid State Machine Control: Integration of mode management (TSM) and micrologic (FSM) for clear system organization.
