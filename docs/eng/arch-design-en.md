@@ -315,7 +315,7 @@ This design helps avoid scattering `printf` calls throughout business logic, red
 
 By design, itnlog does not support flushing when `uedp_itnlog_clear()` is called, because the purpose of this function is to clear logs from the internal buffer and reset statistics state, not to output logs externally. Flushing logs should be done in `uedp_itnlog_dump()` when logs are pulled out and sent to the callback, ensuring that only logs that have already been processed and filtered are output externally, which helps optimize performance and avoid unnecessary log output.
 
-Therefore, `uedp_itnlog_dump()` should ideally be placed outside the scheduler or inside a separate polling task, to ensure that log output does not affect the real-time path of the main tasks, while still ensuring that logs are output efficiently and can be controlled through the filters that have been set up.
+Therefore, `uedp_itnlog_dump()` runs inside the OCE service that `uedp_itnlog_init()` registers, so log output never executes on the real-time path of the main tasks, while logs are still output efficiently and controlled through the configured filters.
 
 This design is called Out-Context Execution (OCE), which helps guarantee the following 3 principles:
 
@@ -329,15 +329,15 @@ Itnlog operates through the following sequence:
 
 1. `uedp_itnlog_init()` initializes the internal ring buffer used to store log entries.
 2. `uedp_itnlog_log()` writes each entry into the internal buffer based on the currently running context.
-3. `uedp_itnlog_dump()` pulls out all entries, applies the level/tag filters, then outputs them to the callback provided by the user.
+3. `uedp_itnlog_dump()`, executed by the OCE service registered in `uedp_itnlog_init()`, pulls out all entries, applies the level/tag filters, then outputs them to the callback provided by the user.
 
-In terms of storage, an entry is currently a small structure containing `level`, `tag`, `task_id`, `msg_sig`, `msg`, `tmstmp`, and `hash`. The buffer uses a fixed-size ring buffer of `UEDP_ITNLOG_MAX_LOG_ENTRIES`, so when the number of written entries exceeds the threshold, the logger automatically dumps before continuing to write.
+In terms of storage, an entry is a small structure containing `level`, `tag`, `task_id`, `msg_sig`, `msg`, `tmstmp` (`ui32`), and `hash`. `msg` and `tag` are copied into per-slot internal buffers of `UEDP_ITNLOG_MSG_MAX_LEN` and `UEDP_ITNLOG_TAG_MAX_LEN` bytes, so the caller does not need to keep those strings alive; longer strings are truncated. The buffer is a fixed-size ring of `UEDP_ITNLOG_MAX_LOG_ENTRIES`. When the number of buffered entries reaches `UEDP_ITNLOG_FLUSH_THRESHOLD`, the logger requests a flush from the OCE service and does not dump inside the logging call. If the ring is full and OCE has not drained it yet, the new entry is dropped and counted; the next dump prints `[ITNLOG] dropped N`.
 
 When dumping, the log line is assembled using the template:
 
 `[ITNLOG] tmstmp task_id msg_id msg`
 
-Here, `task_id` and `msg_id` are output in hex format, while `tmstmp` is a plain integer value with no unit suffix. `msg_id` is the `msg_sig` of the current message at the moment the log was written.
+Here, `task_id` and `msg_id` are output in hex format, while `tmstmp` is a `ui32` printed with `%lu` and has no unit suffix. `msg_id` is the `msg_sig` of the current message at the moment the log was written.
 
 #### Filters and tag semantics
 
@@ -358,7 +358,7 @@ When used on Linux, the callback should be a wrapper that takes a `const char*`,
 #### Internal behavior worth noting
 
 - `uedp_itnlog_log()` takes the `task_id` from the currently running task and the `msg_sig` from the current message, so it is only safe to call while the scheduler is processing a valid message.
-- `uedp_itnlog_dump()` does not just print the log — it also clears the log from the ring buffer and resets internal statistics state.
+- `uedp_itnlog_dump()` prints the log, clears it from the ring buffer, and resets internal statistics state. `msg`/`tag` pointers returned by `uedp_itnlog_clear()` refer to internal storage and stay valid until the next dump.
 - `uedp_itnlog_set_tag(NULL)` is equivalent to turning off tag filtering.
 
 #### Logdp - Log Dispatcher
@@ -391,8 +391,8 @@ To solve this problem, a Priority Escalation mechanism can be added to the Core.
 
 - The total number of priority levels is increased to 24, i.e., the original 16 priority levels plus 8 temporary escalation levels. Note that if the number of TASK_NORMs in use is fewer than 16, the surplus priority levels can be regarded as temporary escalation levels, which helps ensure TASK_NORMs can be temporarily escalated flexibly without being limited by the number of TASK_NORMs currently in use.
 - Each TASK_NORM's metadata gains an additional `base_pri` field to store the TASK_NORM's original priority level, allowing the Core to easily lower it back to the original priority once an important signal has been handled.
-- A new API, `uedp_task_norm_set_urgent(task_id, new_pri)`, is added to allow temporarily raising a TASK_NORM's priority, where `new_pri` must fall within the range from `UEDP_TASK_PRI_LEVEL_16` to `UEDP_TASK_PRI_LEVEL_23` to ensure the temporary priority increase does not exceed the defined limit.
-- A new API, `internal_task_norm_reset_pri(task_id)`, is added to allow lowering a TASK_NORM back to its original priority level after handling an important signal, ensuring that TASK_NORMs can return to their normal state after completing an important task. This means a task is only allowed to hold an elevated priority temporarily for one scheduling round in order to handle an important signal, after which it is automatically lowered back to its original priority level, ensuring other TASK_NORMs also get a fair and effective opportunity to have their own signals processed within the system.
+- `uedp_task_norm_set_urgent(task_id)` temporarily raises a TASK_NORM's priority. The Core selects the lowest free level in `UEDP_TASK_PRI_LEVEL_16` to `UEDP_TASK_PRI_LEVEL_23` automatically; the caller does not pass a priority value.
+- The base priority is restored by the scheduler once the escalated dispatch has run, so the task holds the elevated level only for that scheduling round and other TASK_NORMs keep their fair opportunity to be scheduled. No reset API is exposed to the application.
 - Logic for handling pending escalation is added to the scheduler to ensure that if all temporary escalation levels are already in use, a TASK_NORM that needs to be temporarily escalated will be marked as pending; after one scheduling round, it will be assigned the newest free priority level to process the important signal, helping ensure that important signals are handled promptly as soon as a temporary escalation slot becomes available.
 
 #### Issues to address
@@ -401,11 +401,10 @@ For distributing priority levels when multiple TASK_NORMs are being temporarily 
 
 #### Processing algorithm
 
-- The priority level to assign, `target_pri`, is computed using the formula: `target_pri = current_max + step`.
-- The Core looks up the `g_task_norm_ready` bitmap within the 16-23 partition to find the highest priority level currently ready, then increases `target_pri` step by step from `UEDP_TASK_PRI_LEVEL_16` to `UEDP_TASK_PRI_LEVEL_23` to find a free priority level.
-- If a free priority level is found, `target_pri` is assigned to the TASK_NORM that needs temporary escalation, and this TASK_NORM's `base_pri` is saved so it can be lowered back after the important signal has been processed. If a given priority level is already assigned to another TASK_NORM, the search continues to the next level until either a free level is found or all temporary escalation levels have been checked. The step increment each time is 1 unit rather than 2 units.
-- After the TASK_NORM finishes processing the important signal, the Core automatically lowers it back to its original priority level by reassigning `base_pri` to this TASK_NORM, while also updating the `g_task_norm_ready` bitmap to reflect the priority change.
-- In the case where all temporary priority levels are already in use, the API stores a special value in `target_pri` to mark that the TASK_NORM is pending; after one scheduling round, it is guaranteed that this TASK_NORM will be assigned the newest free priority level to handle the important signal. While pending, this TASK_NORM keeps its original priority level but is marked so the scheduler prioritizes assigning it a temporary priority level once a slot becomes free, which helps ensure important signals are handled promptly as soon as a temporary escalation slot becomes available.
+- `uedp_task_norm_set_urgent(tid)` takes only the task ID. The Core scans the priority levels `UEDP_TASK_PRI_LEVEL_16` to `UEDP_TASK_PRI_LEVEL_23` and selects the lowest one not currently held by another TASK_NORM (`cur_pri`). The caller does not choose the level.
+- If a free level is found, the Core clears the task's ready bit at its current level, sets `cur_pri` to the free level, sets the ready bit there, and clears `urgent_pending`. `base_pri` is left unchanged so the task can be lowered later.
+- If no level is free, the task is marked `urgent_pending = true` and `UEDP_FCR_TASK_PRI_EXHAUSTED` (WARN) is raised once. The scheduler retries the escalation on each idle pass until a level becomes free.
+- After the task has processed its queue, the Core restores `cur_pri` to `base_pri`. If messages remain in its queue, its ready bit is set again at the restored level.
 
 #### Conflict-handling rules
 
@@ -417,27 +416,15 @@ To ensure the consistency of the Ready Bitmap, when a TASK_NORM performs an Esca
 
 #### Hypothetical operational analysis
 
-When a TASK_NORM's handler function is called for execution, this means the TASK_NORM has been selected by the scheduler for execution and has a message allocated from that TASK_NORM's task queue. If the user wants the TASK_NORM to be executed with a higher priority in the next scheduling round, they can call the `uedp_task_norm_set_urgent(task_id, new_pri)` API to temporarily raise that TASK_NORM's priority; this requires that, after calling set_urgent, the TASK_NORM must send a message to itself so that the scheduler selects it for execution in the next scheduling round at the higher priority. After the TASK_NORM finishes processing the urgent message, the Core automatically lowers it back to its original priority level by reassigning `base_pri` to this TASK_NORM, while also updating the `g_task_norm_ready` bitmap to reflect the priority change.
+When a TASK_NORM's handler function is called for execution, this means the TASK_NORM has been selected by the scheduler for execution and has a message allocated from that TASK_NORM's task queue. If the user wants the TASK_NORM to be executed with a higher priority in the next scheduling round, they can call the `uedp_task_norm_set_urgent(task_id)` API to temporarily raise that TASK_NORM's priority; this requires that, after calling set_urgent, the TASK_NORM must send a message to itself so that the scheduler selects it for execution in the next scheduling round at the higher priority. After the TASK_NORM finishes processing the urgent message, the Core automatically lowers it back to its original priority level by reassigning `base_pri` to this TASK_NORM, while also updating the `g_task_norm_ready` bitmap to reflect the priority change.
 
 > So, given that there may be multiple messages in the task queue, should the self-sent message be prioritized for processing, or should the messages already in the task queue be processed in order first?
 
 The answer is that the self-sent message should be processed. This is because processing sequentially would result in a virtual priority-inversion error — that is, the TASK_NORM has been temporarily escalated but must still wait for old messages in the task queue to be processed first, which defeats the purpose of the temporary priority increase. Therefore, when a TASK_NORM sends a message to itself, the Core ensures this message is processed immediately in the next scheduling round at the higher priority, helping to ensure important signals are handled promptly and effectively.
 
-The supplementary mechanism for PE will be Safe LIFO-nested FIFO (S-LnF), to ensure urgent messages are processed immediately without having to wait for old messages in the task queue, while still ensuring urgent messages are processed in a fair and efficient priority order within the system.
+The Safe LIFO-nested FIFO (S-LnF) mechanism below is the supplementary design that ensures urgent messages are processed immediately, without waiting behind older messages in the task queue.
 
-As of version 1.1.0, the PE mechanism was officially implemented with the `uedp_task_norm_set_urgent()` and `internal_task_norm_reset_pri()` APIs to raise and lower a TASK_NORM's temporary priority, along with pending-escalation handling logic added to the scheduler to ensure TASK_NORMs can be temporarily escalated flexibly and effectively within the system. However, the absence of the S-LnF mechanism will be addressed in later versions to ensure urgent messages are processed safely and efficiently, while still ensuring TASK_NORMs can operate flexibly and effectively within the system.
-
-#### Feature-naming update and standardization
-
-In version 1.1.1, the PE mechanism was updated and standardized to the name Atomic Priority Escalation (APE), to better reflect the atomic and safe nature of the temporary priority increase within the system. At the same time, the supplementary Safe LIFO-nested FIFO (S-LnF) mechanism was also implemented, to ensure urgent messages are processed safely and efficiently while still ensuring TASK_NORMs can operate flexibly and effectively within the system.
-
-This mechanism, as it existed in version 1.1.0, has been retroactively redefined as non=S-LnF APE (non-supported Safe LIFO-nested FIFO Atomic Priority Escalation), to better reflect that this mechanism is only guaranteed to work correctly when a TASK_NORM's message queue is empty. If a TASK_NORM has multiple messages in its task queue, virtual priority inversion occurs — that is, the TASK_NORM has been temporarily escalated but must still wait for old messages in the task queue to be processed, which defeats the purpose of the temporary priority increase. The S-LnF mechanism was therefore added to ensure urgent messages are processed immediately without having to wait for old messages in the task queue, while still ensuring urgent messages are processed in a fair and efficient priority order within the system.
-
-From version 1.1.1 onward, the APE mechanism was updated and standardized to the name Safe LIFO-nested FIFO Atomic Priority Escalation (S-LnF APE), to better reflect the safe and effective nature of the temporary priority increase within the system, while also ensuring urgent messages are processed fairly and efficiently within the system.
-
-> So why were the non=S-LnF APE and S-LnF APE mechanisms renamed with the new "Atomic" property?
-
-This stems from the process of testing and migrating from non=S-LnF APE to S-LnF APE. The developer discovered a phenomenon where, after PE had been executed, the task that had previously been granted PE would not be selected for execution by the next scheduling round, even though it still had a higher priority than every other TASK_NORM. This phenomenon occurred because the PE implementation had inadvertently also cleared the TASK_NORM's ready bit before performing the temporary priority increase, which resulted in the TASK_NORM having been escalated but not being selected for execution in the next scheduling round. Because of this, the S-LnF APE mechanism was implemented to ensure urgent messages are processed immediately without having to wait for old messages in the task queue, while still ensuring urgent messages are processed in a fair and efficient priority order within the system.
+The escalation API was first implemented in version 1.1.0 with `uedp_task_norm_set_urgent()`, together with pending-escalation handling in the scheduler. In that version the mechanism was only guaranteed to work when the TASK_NORM's queue held a single message; with multiple queued messages, virtual priority inversion occurred. Version 0.1 of the core supersedes that API: `uedp_task_norm_set_urgent()` takes only `task_id` and selects the escalation level itself, and no reset API is exposed.
 
 ### [SLNF] Safe LIFO-nested FIFO — A safe mechanism for handling urgent messages
 
@@ -484,12 +471,14 @@ Key characteristics of the current design:
 - `ocesvc_register()` only commits `id`, `state`, `next`, and `fill_size` after successfully appending to the list.
 - `ocesvc_unregister()` only removes a registered service and does not allow removing the sentinel `head`.
 - `ocesvc_scheduler()` executes on an FCFS basis and runs at most one READY service per scheduler round.
+- `ocesvc_set_ready(svc)` re-arms a service from its handler (or from a norm task) so it runs again. After the handler returns, the scheduler moves the service to `COMPLETED` only if its state is still `RUNNING`; a service re-armed during its handler stays READY.
+- `ocesvc_ctrl_init()` must be called before the first `ocesvc_register()`.
 
-The proposed operating flow is:
+The operating flow is:
 
 1. The main scheduler finishes processing Norm Tasks and Polling Tasks.
-2. If the system still has spare time, the OCE scheduler traverses from `head->next` and finds the first READY service.
-3. That service transitions to `RUNNING`, its handler is called, then it transitions to `COMPLETED` once processing is finished.
+2. If the system still has spare time, `ocesvc_scheduler()` runs from the idle branch of `uedp_task_scheduler()`, after the polling tasks, and traverses from `head->next` to find the first READY service.
+3. That service transitions to `RUNNING`, its handler is called, then it transitions to `COMPLETED` unless the handler re-armed it with `ocesvc_set_ready()`.
 4. If no service is READY, OCE does not consume any additional CPU time.
 
 This design keeps OCE separate from the Core's real-time path, while remaining simple enough to implement across multiple platforms. At a later stage, μE-OS may extend this model into AOCE with additional fields such as priority, quantum, timeout, and an error callback, but the current foundation should still be understood as FCFS service dispatch on a linked list.

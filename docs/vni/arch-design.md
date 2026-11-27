@@ -404,7 +404,7 @@ Thiết kế này giúp tránh việc rải `printf` trong logic nghiệp vụ, 
 
 Trong thiết kế, itnlog không hỗ trợ flush khi gọi `uedp_itnlog_clear()` vì mục đích của hàm này là xóa log khỏi bộ đệm nội bộ và reset trạng thái thống kê, chứ không phải để xuất log ra ngoài. Việc flush log nên được thực hiện trong `uedp_itnlog_dump()` khi rút log ra và gửi đến callback, đảm bảo rằng chỉ những log đã được xử lý và lọc mới được xuất ra ngoài, giúp tối ưu hiệu suất và tránh việc xuất log không cần thiết.
 
-Do đó, `uedp_itnlog_dump()` sẽ nên được đặt ngoài scheduler hoặc trong một task polling riêng để đảm bảo rằng việc xuất log không ảnh hưởng đến đường đi thời gian thực của các task chính, đồng thời vẫn đảm bảo rằng log được xuất ra một cách hiệu quả và có thể kiểm soát được thông qua các bộ lọc đã thiết lập.
+Do đó, `uedp_itnlog_dump()` chạy bên trong OCE service mà `uedp_itnlog_init()` đăng ký, để việc xuất log không bao giờ nằm trên đường đi thời gian thực của các task chính, đồng thời log vẫn được xuất ra hiệu quả và kiểm soát được thông qua các bộ lọc đã thiết lập.
 
 Thiết kế này được gọi là Out-Context Execution (OCE), giúp đảm bảo 3 nguyên tắc sau:
 
@@ -418,15 +418,15 @@ Itnlog vận hành theo chuỗi sau:
 
 1. `uedp_itnlog_init()` khởi tạo ring buffer nội bộ để lưu log entry.
 2. `uedp_itnlog_log()` ghi từng entry vào bộ đệm nội bộ theo ngữ cảnh đang chạy.
-3. `uedp_itnlog_dump()` rút toàn bộ entry ra, áp dụng bộ lọc level/tag, rồi xuất ra callback do người dùng cung cấp.
+3. `uedp_itnlog_dump()`, được thực hiện bởi OCE service đăng ký trong `uedp_itnlog_init()`, rút toàn bộ entry ra, áp dụng bộ lọc level/tag, rồi xuất ra callback do người dùng cung cấp.
 
-Về mặt lưu trữ, entry hiện tại là một cấu trúc nhỏ chứa `level`, `tag`, `task_id`, `msg_sig`, `msg`, `tmstmp` và `hash`. Bộ đệm dùng ring buffer cố định có kích thước `UEDP_ITNLOG_MAX_LOG_ENTRIES`, vì vậy khi số entry được ghi vượt ngưỡng thì logger sẽ tự dump trước khi ghi tiếp.
+Về mặt lưu trữ, entry là một cấu trúc nhỏ chứa `level`, `tag`, `task_id`, `msg_sig`, `msg`, `tmstmp` (`ui32`) và `hash`. `msg` và `tag` được copy vào buffer nội bộ theo từng slot có kích thước `UEDP_ITNLOG_MSG_MAX_LEN` và `UEDP_ITNLOG_TAG_MAX_LEN`, nên người gọi không cần giữ chuỗi sống lâu; chuỗi dài hơn sẽ bị cắt bớt. Bộ đệm là ring buffer cố định có kích thước `UEDP_ITNLOG_MAX_LOG_ENTRIES`. Khi số entry trong bộ đệm đạt `UEDP_ITNLOG_FLUSH_THRESHOLD`, logger yêu cầu OCE service flush và không dump bên trong lời gọi log. Nếu ring đầy mà OCE chưa kịp rút, entry mới bị bỏ và được đếm; lần dump tiếp theo in `[ITNLOG] dropped N`.
 
 Khi dump, dòng log được ghép theo mẫu:
 
 `[ITNLOG] tmstmp task_id msg_id msg`
 
-Trong đó `task_id` và `msg_id` được xuất ở dạng hex, còn `tmstmp` là giá trị số nguyên không kèm hậu tố đơn vị. `msg_id` chính là `msg_sig` của message hiện tại tại thời điểm log được ghi.
+Trong đó `task_id` và `msg_id` được xuất ở dạng hex, còn `tmstmp` là `ui32` được in bằng `%lu` và không kèm hậu tố đơn vị. `msg_id` chính là `msg_sig` của message hiện tại tại thời điểm log được ghi.
 
 #### Bộ lọc và ngữ nghĩa tag
 
@@ -480,8 +480,8 @@ Về mặt thiết kế ban đầu, μEDP chỉ có tổng số mức ưu tiên 
 
 - Mức ưu tiên được tăng lên tổng số lượng mức là 24, tức 16 mức ưu tiên gốc + 8 mức ưu tiên tăng tạm thời. Lưu ý rằng, giả sử số lượng TASK_NORM sử dụng dưới 16 thì có thể xem các mức ưu tiên dư thừa này như là các mức ưu tiên tăng tạm thời, điều này giúp đảm bảo rằng các TASK_NORM có thể được tăng ưu tiên tạm thời một cách linh hoạt mà không bị giới hạn bởi số lượng TASK_NORM đang sử dụng.
 - Metadata của mỗi TASK_NORM sẽ được bổ sung thêm một trường `base_pri` để lưu trữ mức ưu tiên gốc của TASK_NORM, giúp Core có thể dễ dàng hạ xuống mức ưu tiên ban đầu sau khi xử lý xong tín hiệu quan trọng.
-- API mới `uedp_task_norm_set_urgent(task_id, new_pri)` sẽ được bổ sung để cho phép tăng ưu tiên tạm thời của một TASK_NORM, trong đó `new_pri` phải nằm trong khoảng từ `UEDP_TASK_PRI_LEVEL_16` đến `UEDP_TASK_PRI_LEVEL_23` để đảm bảo rằng mức ưu tiên tăng tạm thời không vượt quá giới hạn đã định.
-- API mới `internal_task_norm_reset_pri(task_id)` sẽ được bổ sung để cho phép hạ xuống mức ưu tiên ban đầu của một TASK_NORM sau khi xử lý xong tín hiệu quan trọng, giúp đảm bảo rằng các TASK_NORM có thể trở lại trạng thái bình thường sau khi hoàn thành nhiệm vụ quan trọng. Điều đó có nghĩa tác vụ chỉ cho phép giữ mức ưu tiên cao tạm thời trong 1 vòng scheduling để xử lý tín hiệu quan trọng, sau đó sẽ tự động hạ xuống mức ưu tiên ban đầu để đảm bảo rằng các TASK_NORM khác cũng có cơ hội được xử lý tín hiệu của mình một cách công bằng và hiệu quả trong hệ thống.
+- API `uedp_task_norm_set_urgent(task_id)` tăng ưu tiên tạm thời của một TASK_NORM. Core tự chọn mức trống thấp nhất trong khoảng `UEDP_TASK_PRI_LEVEL_16` đến `UEDP_TASK_PRI_LEVEL_23`; người gọi không truyền giá trị ưu tiên.
+- Scheduler hoàn lại mức ưu tiên gốc sau khi lượt dispatch có mức tăng đã chạy xong, nên task chỉ giữ mức cao trong đúng một vòng scheduling và các TASK_NORM khác vẫn có cơ hội được xử lý công bằng. Không có API reset nào được mở cho ứng dụng.
 - Bổ sung logic xử lý pending escalation trong scheduler để đảm bảo nếu tất cả các mức ưu tiên tăng tạm thời đều đã được sử dụng thì TASK_NORM cần tăng ưu tiên tạm thời sẽ được đánh dấu là pending, sau 1 vòng scheduling thì sẽ được gán mức ưu tiên trống mới nhất để xử lý tín hiệu quan trọng, giúp đảm bảo rằng tín hiệu quan trọng sẽ được xử lý một cách kịp thời ngay khi có khả năng tăng ưu tiên tạm thời.
 
 #### Các vấn đề cần xử lý
@@ -490,11 +490,10 @@ Phân phối mức ưu tiên nếu có nhiều TASK_NORM cùng được tăng ư
 
 #### Thuật toán xử lý
 
-- Mức ưu tiên cần gán `target_pri` được tính theo công thức: `target_pri = current_max + step`.
-- Core sẽ tra cứu bitmap `g_task_norm_ready` trong phân vùng 16-23 để tìm mức ưu tiên cao nhất đang ready, sau đó sẽ tăng dần `target_pri` từ `UEDP_TASK_PRI_LEVEL_16` đến `UEDP_TASK_PRI_LEVEL_23` để tìm mức ưu tiên trống.
-- Nếu tìm được mức ưu tiên trống thì sẽ gán `target_pri` cho TASK_NORM cần tăng ưu tiên tạm thời, đồng thời lưu `base_pri` của TASK_NORM này để có thể hạ xuống sau khi xử lý xong tín hiệu quan trọng. Nếu 1 mức ưu tiên đã được gán cho một TASK_NORM khác thì sẽ tiếp tục tìm kiếm mức tiếp theo cho đến khi tìm được mức ưu tiên trống hoặc đã kiểm tra hết tất cả các mức ưu tiên tăng tạm thời. Mức tăng mỗi lần sẽ là 1 đơn vị thay vì 2 đơn vị.
-- Sau khi TASK_NORM đã xử lý xong tín hiệu quan trọng, Core sẽ tự động hạ xuống mức ưu tiên ban đầu bằng cách gán `base_pri` trở lại cho TASK_NORM này, đồng thời cập nhật lại bitmap `g_task_norm_ready` để phản ánh sự thay đổi về mức ưu tiên.
-- Nếu trường hợp tất cả các mức ưu tiên tạm thời đều được sử dụng thì API sẽ lưu vào `target_pri` một giá trị đặc biệt để đánh dấu rằng TASK_NORM đã pending, sau 1 vòng scheduling thì sẽ đảm bảo rằng TASK_NORM này được gán mức ưu tiên trống mới nhất để xử lý tín hiệu quan trọng. Trong lúc pending, TASK_NORM này sẽ vẫn giữ mức ưu tiên ban đầu nhưng sẽ được đánh dấu để scheduler ưu tiên gán mức ưu tiên tạm thời khi có slot trống, điều này giúp đảm bảo rằng tín hiệu quan trọng sẽ được xử lý một cách kịp thời ngay khi có khả năng tăng ưu tiên tạm thời.
+- `uedp_task_norm_set_urgent(tid)` chỉ nhận ID tác vụ. Core quét các mức ưu tiên từ `UEDP_TASK_PRI_LEVEL_16` đến `UEDP_TASK_PRI_LEVEL_23` và chọn mức thấp nhất chưa được tác vụ khác giữ (`cur_pri`). Người gọi không chọn mức.
+- Nếu tìm được mức trống, Core xóa bit ready ở mức hiện tại, gán `cur_pri` = mức trống, đặt bit ready ở mức mới và xóa `urgent_pending`. `base_pri` giữ nguyên để có thể hạ xuống sau.
+- Nếu không còn mức trống, tác vụ được đánh dấu `urgent_pending = true` và raise `UEDP_FCR_TASK_PRI_EXHAUSTED` (WARN) một lần. Scheduler thử lại ở mỗi lượt rảnh cho đến khi có mức trống.
+- Sau khi tác vụ xử lý xong hàng đợi, Core khôi phục `cur_pri` về `base_pri`. Nếu hàng đợi vẫn còn tin nhắn, bit ready được đặt lại ở mức đã khôi phục.
 
 #### Quy tắc xử lý xung đột
 
@@ -506,27 +505,15 @@ Phân phối mức ưu tiên nếu có nhiều TASK_NORM cùng được tăng ư
 
 #### Phân tích hoạt động giả định
 
-Khi 1 TASK_NORM được gọi hàm thực thi handler của Task đó, điều này có nghĩa là TASK_NORM đã được scheduler chọn thực thi và có phân bổ tin nhắn từ task queue của TASK_NORM đó. Nếu muốn TASK_NORM được thực thi handler ở vòng scheduling tiếp theo với mức ưu tiên cao hơn, người dùng có thể gọi API `uedp_task_norm_set_urgent(task_id, new_pri)` để tăng ưu tiên tạm thời của TASK_NORM đó, điều này phải đảm bảo sau khi set_urgent thì TASK_NORM phải gửi tin nhắn cho chính nó để được scheduler chọn thực thi ở vòng scheduling tiếp theo với mức ưu tiên cao hơn. Sau khi TASK_NORM đã xử lý xong tin nhắn khẩn cấp, Core sẽ tự động hạ xuống mức ưu tiên ban đầu bằng cách gán `base_pri` trở lại cho TASK_NORM này, đồng thời cập nhật lại bitmap `g_task_norm_ready` để phản ánh sự thay đổi về mức ưu tiên.
+Khi 1 TASK_NORM được gọi hàm thực thi handler của Task đó, điều này có nghĩa là TASK_NORM đã được scheduler chọn thực thi và có phân bổ tin nhắn từ task queue của TASK_NORM đó. Nếu muốn TASK_NORM được thực thi handler ở vòng scheduling tiếp theo với mức ưu tiên cao hơn, người dùng có thể gọi API `uedp_task_norm_set_urgent(task_id)` để tăng ưu tiên tạm thời của TASK_NORM đó, điều này phải đảm bảo sau khi set_urgent thì TASK_NORM phải gửi tin nhắn cho chính nó để được scheduler chọn thực thi ở vòng scheduling tiếp theo với mức ưu tiên cao hơn. Sau khi TASK_NORM đã xử lý xong tin nhắn khẩn cấp, Core sẽ tự động hạ xuống mức ưu tiên ban đầu bằng cách gán `base_pri` trở lại cho TASK_NORM này, đồng thời cập nhật lại bitmap `g_task_norm_ready` để phản ánh sự thay đổi về mức ưu tiên.
 
 > Vậy giả sử khi có nhiều tin nhắn nằm trong task queue thì tin nhắn tự gọi chính nó nên được ưu tiên xử lý hay là xử lý tuần tự tin nhắn trong task queue?
 
 Câu trả lời là xử lý tin nhắn tự gọi chính nó. Bởi vì nếu xử lý tuần tự sẽ tin ra lỗi ưu tiên ảo, tức là TASK_NORM đã được tăng ưu tiên tạm thời nhưng vẫn phải chờ xử lý các tin nhắn cũ trong task queue, điều này sẽ làm mất đi ý nghĩa của việc tăng ưu tiên tạm thời. Do đó, khi TASK_NORM tự gọi chính nó, Core sẽ đảm bảo rằng tin nhắn này được xử lý ngay lập tức ở vòng scheduling tiếp theo với mức ưu tiên cao hơn, giúp đảm bảo rằng tín hiệu quan trọng được xử lý kịp thời và hiệu quả.
 
-Cơ chế bổ sung cho PE sẽ là Safe LIFO-nested FIFO (S-LnF) để đảm bảo rằng các tin nhắn khẩn cấp được xử lý ngay lập tức mà không phải chờ đợi các tin nhắn cũ trong task queue, đồng thời vẫn đảm bảo rằng các tin nhắn khẩn cấp được xử lý theo thứ tự ưu tiên một cách công bằng và hiệu quả trong hệ thống.
+Cơ chế bổ sung là Safe LIFO-nested FIFO (S-LnF), được mô tả ở mục dưới, để đảm bảo rằng các tin nhắn khẩn cấp được xử lý ngay lập tức mà không phải chờ đợi các tin nhắn cũ trong task queue.
 
-Ở thời điểm phiên bản 1.1.0, cơ chế PE chính thức được triển khai với các API `uedp_task_norm_set_urgent()` và `internal_task_norm_reset_pri()` để tăng và hạ mức ưu tiên tạm thời của TASK_NORM, đồng thời bổ sung logic xử lý pending escalation trong scheduler để đảm bảo rằng các TASK_NORM có thể được tăng ưu tiên tạm thời một cách linh hoạt và hiệu quả trong hệ thống. Tuy nhiên, sự thiếu vắng của cơ chế S-LnF sẽ được bổ sung trong các phiên bản tiếp theo để đảm bảo rằng các tin nhắn khẩn cấp được xử lý một cách an toàn và hiệu quả, đồng thời vẫn đảm bảo rằng các TASK_NORM có thể hoạt động một cách linh hoạt và hiệu quả trong hệ thống.
-
-#### Cập nhật và tiêu chuẩn hóa tên gọi tính năng
-
-Trong phiên bản 1.1.1, cơ chế PE sẽ được cập nhật và tiêu chuẩn hóa tên gọi thành Atomic Priority Escalation (APE) để phản ánh rõ hơn tính chất của việc tăng ưu tiên tạm thời một cách nguyên tử và an toàn trong hệ thống. Đồng thời, cơ chế bổ sung Safe LIFO-nested FIFO (S-LnF) cũng sẽ được triển khai để đảm bảo rằng các tin nhắn khẩn cấp được xử lý một cách an toàn và hiệu quả, đồng thời vẫn đảm bảo rằng các TASK_NORM có thể hoạt động một cách linh hoạt và hiệu quả trong hệ thống.
-
-Cơ chế này ở phiên bản 1.1.0 được tái định nghĩa gọi là non=S-LnF APE (non-supported Safe LIFO-nested FIFO Atomic Priority Escalation) nhằm phản ánh rõ hơn cơ chế này chỉ đảm bảo hoạt động khi TASK_NORM có message queue trống. Nếu TASK_NORM có nhiều tin nhắn trong task queue thì sẽ xảy ra tình trạng ưu tiên ảo, tức là TASK_NORM đã được tăng ưu tiên tạm thời nhưng vẫn phải chờ xử lý các tin nhắn cũ trong task queue, điều này sẽ làm mất đi ý nghĩa của việc tăng ưu tiên tạm thời. Do đó, cơ chế S-LnF sẽ được bổ sung để đảm bảo rằng các tin nhắn khẩn cấp được xử lý ngay lập tức mà không phải chờ đợi các tin nhắn cũ trong task queue, đồng thời vẫn đảm bảo rằng các tin nhắn khẩn cấp được xử lý theo thứ tự ưu tiên một cách công bằng và hiệu quả trong hệ thống.
-
-Từ phiên bản 1.1.1 trở đi, cơ chế APE sẽ được cập nhật và tiêu chuẩn hóa tên gọi thành Safe LIFO-nested FIFO Atomic Priority Escalation (S-LnF APE) để phản ánh rõ hơn tính chất của việc tăng ưu tiên tạm thời một cách an toàn và hiệu quả trong hệ thống, đồng thời đảm bảo rằng các tin nhắn khẩn cấp được xử lý một cách công bằng và hiệu quả trong hệ thống.
-
-> Vậy tại sao cơ chế non=S-LnF APE và S-LnF APE lại được tái định danh với tính chất Atomic mới ?
-
-Điều này bắt nguồn từ quá trình kiểm tra và chuyển đổi từ non=S-LnF APE sang S-LnF APE. Nhà phát triển đã nhận ra 1 hiện tượng khi thực thi quyền PE xong thì tác vụ được nhận PE trước đó sẽ không được vòng lập lịch chọn xử lý tiếp theo dù có mức ưu tiên cao hơn toàn bộ các TASK_NORM khác. Hiện tượng này diễn ra do việc triển khai PE đã vô tình bổ sung thêm việc clear ready bit của TASK_NORM trước khi thực hiện tăng ưu tiên tạm thời, điều này dẫn đến việc TASK_NORM đã được tăng ưu tiên tạm thời nhưng lại không được chọn thực thi tiếp theo trong vòng lập lịch. Do đó, cơ chế S-LnF APE sẽ được triển khai để đảm bảo rằng các tin nhắn khẩn cấp được xử lý ngay lập tức mà không phải chờ đợi các tin nhắn cũ trong task queue, đồng thời vẫn đảm bảo rằng các tin nhắn khẩn cấp được xử lý theo thứ tự ưu tiên một cách công bằng và hiệu quả trong hệ thống.
+API tăng ưu tiên được triển khai lần đầu ở phiên bản 1.1.0 với `uedp_task_norm_set_urgent()`, kèm logic pending escalation trong scheduler. Ở phiên bản đó cơ chế chỉ đảm bảo đúng khi queue của TASK_NORM chỉ có một tin nhắn; khi có nhiều tin nhắn trong queue sẽ xảy ra ưu tiên ảo. Core phiên bản 0.1 thay thế API này: `uedp_task_norm_set_urgent()` chỉ nhận `task_id` và tự chọn mức ưu tiên, không mở API reset cho ứng dụng.
 
 ### [SLNF] Safe LIFO-nested FIFO - Cơ chế xử lý tin nhắn khẩn cấp an toàn
 
@@ -615,8 +602,10 @@ Kết luận:
 
 #### Thiết kế triển khai hiện tại
 
-- Scheduler sau khi xử lý xong tất cả các Task Norm và Task Polling sẽ chuyển sang OCE khi hệ thống còn rảnh.
+- Scheduler sau khi xử lý xong tất cả các Task Norm và Task Polling sẽ chuyển sang OCE khi hệ thống còn rảnh. `ocesvc_scheduler()` được gọi từ nhánh idle của `uedp_task_scheduler()`, sau khi chạy các task poll.
 - OCE scheduler duyệt danh sách liên kết nội bộ, tìm service READY đầu tiên, và chỉ thực thi tối đa một service trong mỗi vòng scheduler.
+- `ocesvc_set_ready(svc)` cho phép service (hoặc một TASK_NORM) đặt lại trạng thái READY để chạy lại. Sau khi handler trả về, scheduler chỉ chuyển service sang `COMPLETED` nếu trạng thái vẫn là `RUNNING`; service được đặt lại READY trong lúc handler chạy sẽ giữ trạng thái READY.
+- `ocesvc_ctrl_init()` phải được gọi trước `ocesvc_register()` lần đầu.
 - Cách triển khai này giữ OCE ở mức FCFS đơn giản, không cần một hàng đợi riêng ngoài linked list hiện có.
 
 Thiết kế này đủ để phục vụ các dịch vụ hậu trường nhẹ và có thể mở rộng dần lên AOCE khi μE-OS cần thêm priority, quantum, timeout, và error callback.
