@@ -11,6 +11,8 @@
 #include "uedp_msg.h"
 #include "fifo.h"
 #include "uedp_fcr.h"
+#include "uedp_ocesvc.h"
+#include "uedp_ctrl.h"
 
 // ANCHOR - Khai báo các biến toàn cục quản lý thông tin của các tác vụ trong hệ thống UEDP
 
@@ -159,6 +161,13 @@ RETR_STAT uedp_task_scheduler() {
   // Thực thi các tác vụ poll nếu cần thiết
   internal_uedp_task_poll_exec();
 
+  // Hệ thống rảnh: cho phép một dịch vụ OCE READY chạy
+  ocesvc_scheduler();
+
+  #ifdef UEDP_TRACE
+    uedp_ctrl_inject(UEDP_CTRL_AFTER_SCHEDULER);
+  #endif
+  
   return STAT_NRDY; // Trả về NRDY nếu không có tác vụ nào sẵn sàng để thực thi
 }
 
@@ -406,49 +415,57 @@ void uedp_task_norm_set_urgent(task_id_t tid) {
   internal_uedp_task_norm_set_urgent(tid);
 }
 
+sta bool internal_uedp_task_norm_is_pri_taken(task_id_t self_tid, task_pri_t pri) {
+  for (ui8 i = 0; i < g_task_norm_count; i++) {
+    if (g_task_norm_table[i].id != self_tid && g_task_norm_table[i].cur_pri == pri) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void internal_uedp_task_norm_set_urgent(task_id_t tid) {
   task_norm_t* task = internal_uedp_task_get_task_norm_by_id(tid);
-
-  if (task) {
-    pal_enter_critical(); // Vào critical section để đảm bảo an toàn khi truy cập và cập nhật trạng thái của tác vụ
-
-    internal_uedp_task_norm_clear_ready(task->cur_pri); // Xóa trạng thái sẵn sàng hiện tại của tác vụ để chuẩn bị thiết lập mức độ ưu tiên khẩn cấp mới
-    task_pri_t urgent_pri = 0x0u;
-
-    // Loop để tìm bit 0 đầu tiên trong dãy 16-23
-    for (ui8 p = 16; p <= 23; p++) {
-      //NOTE - enforce unsigned
-      if (!(g_task_norm_ready & (1u << p))) {
-        urgent_pri = (task_pri_t)p + UEDP_TASK_PRI_LEVEL_0; // Tính toán mức độ ưu tiên khẩn cấp dựa trên bit 0 đầu tiên tìm thấy
-        break;
-      }
-    }
-
-    // Nếu đã tìm được mức độ ưu tiên khẩn cấp, thiết lập mức độ ưu tiên đó cho tác vụ
-    if (urgent_pri != 0x0u) {
-      task->cur_pri = urgent_pri; // Cập nhật mức độ ưu tiên của tác vụ lên mức độ ưu tiên khẩn cấp
-      // Đặt trạng thái sẵn sàng cho tác vụ để đảm bảo nó sẽ được thực thi ngay lập tức ở vòng tiếp theo của scheduler
-      internal_uedp_task_norm_set_ready(urgent_pri);
-      task->urgent_pending = false; // Đặt cờ tín hiệu khẩn cấp đang chờ xử lý về false 
-                                    // vì đã thiết lập mức độ ưu tiên khẩn cấp cho tác vụ
-    } else {
-      task->urgent_pending = true; // Nếu không còn mức độ ưu tiên khẩn cấp nào có sẵn, 
-                                  // đánh dấu tác vụ này đang có tín hiệu khẩn cấp đang chờ xử lý
-      UEDP_FCR_RAISE(UEDP_FCR_TASK_PRI_EXHAUSTED); // Hết mức ưu tiên tạm thời (16-23) cho Priority Escalation
-    }
-
-    pal_exit_critical(); // Thoát critical section sau khi đã cập nhật trạng thái của tác vụ
+  if (task == NULL) {
+    return;
   }
+
+  pal_enter_critical();
+
+  task_pri_t urgent_pri = 0x0u;
+  for (task_pri_t p = UEDP_TASK_PRI_LEVEL_16; p <= UEDP_TASK_PRI_LEVEL_23; p++) {
+    if (!internal_uedp_task_norm_is_pri_taken(tid, p)) {
+      urgent_pri = p;
+      break;
+    }
+  }
+
+  if (urgent_pri != 0x0u) {
+    internal_uedp_task_norm_clear_ready(task->cur_pri);
+    task->cur_pri = urgent_pri;
+    internal_uedp_task_norm_set_ready(urgent_pri);
+    task->urgent_pending = false;
+  } else {
+    if (!task->urgent_pending) {
+      UEDP_FCR_RAISE(UEDP_FCR_TASK_PRI_EXHAUSTED);
+    }
+    task->urgent_pending = true;
+  }
+
+  pal_exit_critical();
 }
 
 void internal_uedp_task_norm_reset_urgent(task_id_t tid) {
   task_norm_t* task = internal_uedp_task_get_task_norm_by_id(tid);
   if (task) {
     pal_enter_critical(); // Vào critical section để đảm bảo an toàn khi truy cập và cập nhật trạng thái của tác vụ
-    internal_uedp_task_norm_clear_ready(task->cur_pri); // Xóa trạng thái sẵn sàng của tác vụ để đảm bảo nó không còn được thực thi ở mức độ ưu tiên khẩn cấp
-    task->cur_pri = task->base_pri; // Đặt lại mức độ ưu tiên của tác vụ về mức độ ưu tiên cơ bản
-    task->urgent_pending = false; // Đặt lại cờ tín hiệu khẩn cấp đang chờ xử lý về false
-    pal_exit_critical(); // Thoát critical section sau khi đã cập nhật trạng thái của tác vụ
+    internal_uedp_task_norm_clear_ready(task->cur_pri);
+    task->cur_pri = task->base_pri;
+    task->urgent_pending = false;
+    if (!fifo_is_empty(&task->msg_queue)) {
+      internal_uedp_task_norm_set_ready(task->cur_pri);
+    }
+    pal_exit_critical();
   }
   //NOTE: task == NULL đã được raise sẵn bên trong internal_uedp_task_get_task_norm_by_id() ở trên,
   // không cần raise thêm lần nữa ở đây để tránh double-raise.
