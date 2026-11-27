@@ -1,0 +1,1851 @@
+import os
+import json
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import locale
+
+os.environ.setdefault("PYTHONUTF8", "1")
+if not os.environ.get("LC_CTYPE"):
+    os.environ["LC_CTYPE"] = "C.UTF-8"
+try:
+    locale.setlocale(locale.LC_CTYPE, "")
+except locale.Error:
+    pass
+
+import tkinter as tk
+from argparse import ArgumentParser
+from datetime import date, datetime, timedelta
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+DETACHED_PROCESS = 0x00000008 if os.name == "nt" else 0
+CREATE_NEW_PROCESS_GROUP = 0x00000200 if os.name == "nt" else 0
+UTF8_ENV = {
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "LANGUAGE": "C",
+    "GIT_COMMITTER_ENCODING": "UTF-8",
+}
+UI_FONT = os.environ.get("GITSP_UI_FONT", "Noto Sans")
+MONO_FONT = os.environ.get("GITSP_MONO_FONT", "Noto Sans Mono")
+SEP = "\x1f"
+DATE_FORMAT = "--date=format:%Y-%m-%d %H:%M"
+LOG_FORMAT = f"--pretty=format:%H{SEP}%h{SEP}%ad{SEP}%an{SEP}%s"
+PROTECTED_BRANCHES = ("main", "release", "feat", "fix", "integration")
+RAW_AUTHOR = re.compile(rb"author (.*) <(.*)> (\d+ [+-]\d{4})$")
+
+
+class GitError(Exception):
+    pass
+
+
+def git_run(repo, *args, env=None, stdin=None):
+    git_env = {**os.environ, **UTF8_ENV}
+    if env:
+        git_env.update(env)
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo, *args],
+            input=stdin,
+            env=git_env,
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except OSError as exc:
+        raise GitError(f"Không chạy được git: {exc}") from exc
+    return result.returncode, result.stdout, result.stderr
+
+
+def decode_utf8(data):
+    return data.decode("utf-8", errors="replace") if isinstance(data, bytes) else data
+
+
+def launch_background():
+    if os.name == "nt":
+        subprocess.Popen(
+            [sys.executable, "-m", "gitsp", "--foreground"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
+        return True
+
+    first_pid = os.fork()
+    if first_pid:
+        return True
+    os.setsid()
+    second_pid = os.fork()
+    if second_pid:
+        os._exit(0)
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.devnull, "rb") as stdin, open(os.devnull, "ab") as stdout, open(os.devnull, "ab") as stderr:
+        os.dup2(stdin.fileno(), sys.stdin.fileno())
+        os.dup2(stdout.fileno(), sys.stdout.fileno())
+        os.dup2(stderr.fileno(), sys.stderr.fileno())
+    return False
+
+
+def git_ok(repo, *args, env=None):
+    code, out, err = git_run(repo, *args, env=env)
+    if code != 0:
+        raise GitError(decode_utf8(err or out).strip())
+    return out
+
+
+def detect_repo(start):
+    try:
+        return decode_utf8(git_ok(start, "rev-parse", "--show-toplevel")).strip()
+    except GitError:
+        return start
+
+
+def list_branches(repo):
+    raw = git_ok(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes")
+    names = {
+        name
+        for name in decode_utf8(raw).splitlines()
+        if name and name != "origin" and not name.endswith("/HEAD")
+    }
+    return sorted(names)
+
+
+def current_branch(repo):
+    return decode_utf8(git_ok(repo, "branch", "--show-current")).strip()
+
+
+def is_repo_root(path):
+    if not os.path.isdir(path):
+        return False
+    code, out, _ = git_run(path, "rev-parse", "--show-toplevel")
+    if code != 0:
+        return False
+    top = decode_utf8(out).strip()
+    return os.path.normcase(os.path.realpath(top)) == os.path.normcase(os.path.realpath(path))
+
+
+def resolve_ref(repo, branch):
+    if git_run(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")[0] == 0:
+        return branch
+    if git_run(repo, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}")[0] == 0:
+        return f"origin/{branch}"
+    raise GitError(f"Repo '{repo}' không có branch '{branch}'.")
+
+
+def gitlinks_in_ref(repo, ref):
+    raw = decode_utf8(git_ok(repo, "ls-tree", "-r", "-z", ref))
+    links = {}
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        meta, path = record.split("\t", 1)
+        mode, _kind, sha = meta.split()
+        if mode == "160000":
+            links[path] = sha
+    return links
+
+
+def unpushed_commits(subrepo):
+    raw = decode_utf8(git_ok(subrepo, "log", "--oneline", "HEAD", "--not", "--remotes"))
+    return [line for line in raw.splitlines() if line]
+
+
+def list_submodules(repo):
+    raw = decode_utf8(git_ok(repo, "submodule", "status", "--recursive"))
+    entries = []
+    for line in raw.splitlines():
+        parts = line.strip().split(maxsplit=2)
+        if len(parts) < 2:
+            continue
+        sha = parts[0].lstrip("-+U")
+        path = parts[1]
+        subrepo = os.path.join(repo, *path.split("/"))
+        initialized = is_repo_root(subrepo)
+        if initialized:
+            branch = current_branch(subrepo)
+            dirty = working_tree_dirty(subrepo)
+        else:
+            branch = "(chưa khởi tạo)"
+            dirty = False
+        entries.append(
+            {
+                "path": path,
+                "sha": sha,
+                "branch": branch,
+                "dirty": dirty,
+                "repo": subrepo,
+                "initialized": initialized,
+            }
+        )
+    return entries
+
+
+def normalize_rule(value):
+    if isinstance(value, str):
+        return {"branch": value, "commit": ""}
+    return {"branch": str(value.get("branch", "")).strip(), "commit": str(value.get("commit", "")).strip()}
+
+
+def encode_rule(branch, commit):
+    return branch if not commit else {"branch": branch, "commit": commit}
+
+
+def describe_rule(rule):
+    parts = [rule["branch"]] if rule["branch"] else []
+    if rule["commit"]:
+        parts.append(f"@ {rule['commit'][:8]}")
+    return " ".join(parts)
+
+
+def resolve_commit(subrepo, commit):
+    code, out, _ = git_run(subrepo, "rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}")
+    return decode_utf8(out).strip() if code == 0 else ""
+
+
+def rule_problems(path, subrepo, rule):
+    problems = []
+    if rule["branch"] and not branch_exists(subrepo, rule["branch"]):
+        problems.append(f"Branch ràng buộc '{rule['branch']}' không tồn tại trong {path}.")
+        return problems
+    if rule["commit"]:
+        if not resolve_commit(subrepo, rule["commit"]):
+            problems.append(f"Commit ràng buộc {rule['commit'][:8]} không có trong {path}. Hãy fetch submodule trước.")
+        elif rule["branch"]:
+            tip = resolve_commit(subrepo, resolve_ref(subrepo, rule["branch"]))
+            if tip != rule["commit"]:
+                problems.append(
+                    f"{path}: branch '{rule['branch']}' đang ở {tip[:8]}, khác commit ràng buộc {rule['commit'][:8]}."
+                )
+    return problems
+
+
+def rule_satisfied(entry, rule):
+    if rule["branch"] and entry["branch"] != rule["branch"]:
+        return False
+    if rule["commit"] and entry["sha"] != rule["commit"]:
+        return False
+    return True
+
+
+def apply_rule(subrepo, path, rule):
+    if rule["branch"]:
+        checkout_branch(subrepo, rule["branch"])
+    elif rule["commit"]:
+        git_ok(subrepo, "checkout", "--detach", rule["commit"])
+    if rule["commit"]:
+        head = decode_utf8(git_ok(subrepo, "rev-parse", "HEAD")).strip()
+        if head != rule["commit"]:
+            raise GitError(f"{path} đang ở {head[:8]}, khác commit ràng buộc {rule['commit'][:8]}.")
+
+
+def plan_submodule_switch(repo, target, rules):
+    source_links = gitlinks_in_ref(repo, "HEAD")
+    target_links = gitlinks_in_ref(repo, resolve_ref(repo, target))
+    entries = {entry["path"]: entry for entry in list_submodules(repo)}
+    leaving = sorted(set(source_links) - set(target_links))
+    staying = sorted(set(source_links) & set(target_links))
+    arriving = sorted(set(target_links) - set(source_links))
+    problems = []
+
+    if working_tree_dirty(repo):
+        problems.append("Repo chính còn thay đổi đã tracked. Hãy commit hoặc stash trước.")
+    missing = [path for path in staying + arriving if path not in rules]
+    if missing:
+        problems.append("Thiếu ràng buộc cho: " + ", ".join(missing))
+
+    for path in staying:
+        entry = entries.get(path)
+        if not entry or not entry["initialized"]:
+            problems.append(f"{path} chưa khởi tạo. Chạy git submodule update --init --recursive trước (mục 14.2).")
+            continue
+        if entry["dirty"]:
+            problems.append(f"{path} còn thay đổi chưa commit.")
+        elif path in rules:
+            problems.extend(rule_problems(path, entry["repo"], rules[path]))
+
+    for path in leaving:
+        entry = entries.get(path)
+        full = os.path.join(repo, *path.split("/"))
+        if entry is None or not entry["initialized"]:
+            if os.path.isdir(full) and os.listdir(full):
+                problems.append(f"{path} không phải repo nhưng còn nội dung. Xử lý theo mục 14.6 trước khi chuyển.")
+            continue
+        if entry["dirty"]:
+            problems.append(f"{path} còn thay đổi chưa commit. Commit và push trong PLTF trước (mục 14.6, bước 2).")
+        if unpushed_commits(entry["repo"]):
+            problems.append(f"{path} có commit chưa push. Push branch PLTF trước (mục 14.6, bước 2).")
+        if entry["sha"] != source_links[path]:
+            problems.append(
+                f"{path} không ở commit pin. Chạy git submodule update --init -- {path} trước (mục 14.6, bước 3)."
+            )
+
+    for path in arriving:
+        full = os.path.join(repo, *path.split("/"))
+        if os.path.isdir(full) and untracked_under(repo, path):
+            problems.append(f"{path} còn file chưa được Git quản lý. Di chuyển hoặc xóa trước khi chuyển (mục 6).")
+
+    return {
+        "problems": problems,
+        "leaving": leaving,
+        "staying": staying,
+        "arriving": arriving,
+        "entries": entries,
+    }
+
+
+def untracked_under(repo, path):
+    raw = decode_utf8(git_ok(repo, "status", "--porcelain", "--untracked-files=all", "--ignored", "--", path))
+    return [line for line in raw.splitlines() if line[:2] in ("??", "!!")]
+
+
+def parked_path(repo, path):
+    return os.path.join(repo, ".git", "gitsp-parked", *path.split("/"))
+
+
+def park_submodule(repo, path):
+    src = os.path.join(repo, *path.split("/"))
+    dst = parked_path(repo, path)
+    if os.path.lexists(dst):
+        raise GitError(f"Đã có bản lưu của {path} tại {dst}. Xử lý trước khi chuyển branch.")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
+
+
+def unpark_submodule(repo, path):
+    src = parked_path(repo, path)
+    if not os.path.isdir(src):
+        return False
+    dst = os.path.join(repo, *path.split("/"))
+    if os.path.isdir(dst):
+        if os.listdir(dst):
+            raise GitError(f"{path} đang có nội dung, không khôi phục được bản lưu. Di chuyển nội dung đó trước.")
+        os.rmdir(dst)
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.move(src, dst)
+    return True
+
+
+def apply_submodule_switch(repo, target, rules, plan):
+    parked = []
+    try:
+        for path in plan["leaving"]:
+            if is_repo_root(os.path.join(repo, *path.split("/"))):
+                park_submodule(repo, path)
+                parked.append(path)
+        checkout_branch(repo, target)
+    except GitError:
+        for path in reversed(parked):
+            unpark_submodule(repo, path)
+        raise
+    for path in plan["arriving"]:
+        unpark_submodule(repo, path)
+        git_ok(repo, "submodule", "update", "--init", "--", path)
+    for path in plan["arriving"] + plan["staying"]:
+        apply_rule(os.path.join(repo, *path.split("/")), path, rules[path])
+    return parked
+
+
+NO_PROMPT_ENV = {"GIT_TERMINAL_PROMPT": "0"}
+
+
+def remove_tree(path):
+    def clear_readonly(func, target, _exc_info):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    shutil.rmtree(path, onerror=clear_readonly)
+
+
+def tree_mode(repo, ref, path):
+    raw = decode_utf8(git_ok(repo, "ls-tree", ref, "--", path)).strip()
+    return raw.split()[0] if raw else ""
+
+
+def find_remote_pin(repo, url, tree):
+    tmp = tempfile.mkdtemp(prefix="gitsp-remote-", dir=os.path.join(repo, ".git"))
+    try:
+        clone = os.path.join(tmp, "remote")
+        git_ok(repo, "clone", "--quiet", "--no-checkout", "--", url, clone, env=NO_PROMPT_ENV)
+        raw = decode_utf8(git_ok(clone, "log", "--remotes", "--format=%H %T"))
+        for line in raw.splitlines():
+            commit, commit_tree = line.split()
+            if commit_tree == tree:
+                return commit
+        return None
+    finally:
+        remove_tree(tmp)
+
+
+def rollback_conversion(repo, original, work_branch, path, parked, gitmodules_existed):
+    errors = []
+
+    def attempt(step):
+        try:
+            step()
+        except (GitError, OSError) as exc:
+            errors.append(str(exc))
+
+    attempt(lambda: git_ok(repo, "reset", "-q"))
+    gitmodules = os.path.join(repo, ".gitmodules")
+    if gitmodules_existed:
+        attempt(lambda: git_ok(repo, "checkout", "--", ".gitmodules"))
+    elif os.path.exists(gitmodules):
+        attempt(lambda: os.remove(gitmodules))
+    full = os.path.join(repo, *path.split("/"))
+    if parked:
+        attempt(lambda: remove_tree(full) if os.path.isdir(full) else None)
+        attempt(lambda: unpark_submodule(repo, path))
+    attempt(lambda: git_ok(repo, "switch", original))
+    attempt(lambda: git_ok(repo, "branch", "-d", work_branch))
+    return errors
+
+
+def convert_folder_to_submodule(repo, path, url, work_branch, commit_name):
+    path = path.strip().strip("/")
+    url = url.strip()
+    work_branch = work_branch.strip()
+    commit_name = commit_name.strip()
+    if not path or any(part in ("", ".", "..") for part in path.split("/")):
+        raise GitError("Đường dẫn thư mục không hợp lệ.")
+    if not url:
+        raise GitError("Chưa nhập URL remote của submodule.")
+    if not commit_name:
+        raise GitError("Chưa nhập tên người/nhóm cho commit.")
+    original = current_branch(repo)
+    if not original:
+        raise GitError("Đang ở detached HEAD, hãy checkout một branch trước.")
+    if git_run(repo, "check-ref-format", "--branch", work_branch)[0] != 0:
+        raise GitError(f"Tên branch '{work_branch}' không hợp lệ.")
+    if work_branch in PROTECTED_BRANCHES or branch_exists(repo, work_branch):
+        raise GitError(f"Branch '{work_branch}' là branch được bảo vệ hoặc đã tồn tại. Chọn tên khác.")
+    if working_tree_dirty(repo):
+        raise GitError("Working tree còn thay đổi đã tracked. Hãy commit hoặc stash trước.")
+    if untracked_under(repo, path):
+        raise GitError(f"'{path}' còn file chưa được Git quản lý hoặc bị ignore. Di chuyển hoặc xóa trước (mục 6).")
+    mode = tree_mode(repo, "HEAD", path)
+    if mode == "160000":
+        raise GitError(f"'{path}' trên {original} đã là submodule (gitlink).")
+    if mode != "040000":
+        raise GitError(f"'{path}' không phải thư mục thường trên {original} (mode '{mode or 'không có'}').")
+
+    tree = decode_utf8(git_ok(repo, "rev-parse", f"HEAD:{path}")).strip()
+    pin = find_remote_pin(repo, url, tree)
+    if not pin:
+        raise GitError(
+            f"Không tìm thấy commit nào trên {url} có cây giống '{path}' ({tree[:8]}). "
+            "Dừng để không đổi nội dung (mục 14.9, blocker 1)."
+        )
+    gitmodules_existed = git_run(repo, "cat-file", "-e", "HEAD:.gitmodules")[0] == 0
+
+    git_ok(repo, "switch", "-c", work_branch)
+    parked = False
+    try:
+        park_submodule(repo, path)
+        parked = True
+        git_ok(repo, "rm", "-r", "--cached", "-q", "--", path)
+        git_ok(repo, "update-index", "--add", "--cacheinfo", f"160000,{pin},{path}")
+        git_ok(repo, "config", "-f", ".gitmodules", f"submodule.{path}.path", path)
+        git_ok(repo, "config", "-f", ".gitmodules", f"submodule.{path}.url", url)
+        git_ok(repo, "add", "--", ".gitmodules")
+        git_ok(repo, "submodule", "update", "--init", "--", path, env=NO_PROMPT_ENV)
+        sub = os.path.join(repo, *path.split("/"))
+        if decode_utf8(git_ok(sub, "rev-parse", "HEAD")).strip() != pin:
+            raise GitError("Submodule không checkout đúng commit pin.")
+        if decode_utf8(git_ok(sub, "rev-parse", "HEAD^{tree}")).strip() != tree:
+            raise GitError("Cây của submodule không khớp thư mục gốc.")
+        if decode_utf8(git_ok(sub, "status", "--porcelain")).strip():
+            raise GitError("Submodule có thay đổi sau khi checkout.")
+        message = build_commit_message("chore", path, commit_name, f"track {path} as submodule gitlink at {pin[:8]}")
+        git_ok(repo, "commit", "-m", message)
+    except (GitError, OSError) as exc:
+        errors = rollback_conversion(repo, original, work_branch, path, parked, gitmodules_existed)
+        message = str(exc)
+        if errors:
+            message += "\nRollback chưa hoàn tất:\n- " + "\n- ".join(errors)
+        raise GitError(message) from exc
+    return pin
+
+
+def migration_audit(repo):
+    branches = list_local_branches(repo)
+    paths = sorted({path for branch in branches for path in gitlinks_in_ref(repo, branch)} | {"pltf"})
+    lines = []
+    for path in paths:
+        moddir = os.path.join(repo, ".git", "modules", *path.split("/"))
+        has_moddir = os.path.isdir(moddir)
+        trees = {}
+        if has_moddir:
+            raw = decode_utf8(git_ok(repo, f"--git-dir={moddir}", "log", "--all", "--format=%H %T"))
+            for line in raw.splitlines():
+                commit, tree = line.split()
+                trees.setdefault(tree, []).append(commit)
+        for branch in branches:
+            line = decode_utf8(git_ok(repo, "ls-tree", branch, "--", path)).strip()
+            gitmodules = git_run(repo, "cat-file", "-e", f"{branch}:.gitmodules")[0] == 0
+            if not line:
+                state = "không có"
+            else:
+                mode, _kind, sha = line.split()[:3]
+                if mode == "160000":
+                    present = has_moddir and git_run(repo, f"--git-dir={moddir}", "cat-file", "-e", f"{sha}^{{commit}}")[0] == 0
+                    state = f"gitlink, pin {sha[:8]}, {'có' if present else 'THIẾU'} trong kho PLTF cục bộ"
+                elif mode == "040000":
+                    matches = trees.get(sha, [])
+                    if matches:
+                        state = f"cây thường, khớp PLTF {matches[0][:8]}"
+                    else:
+                        state = "cây thường, KHÔNG khớp commit PLTF nào (blocker 14.9.1)"
+                else:
+                    state = f"mode {mode}"
+            lines.append(f"{branch}: {path} → {state}; .gitmodules: {'có' if gitmodules else 'không'}")
+    return lines
+
+
+
+def load_submodule_rules(repo):
+    path = os.path.join(repo, ".gitsp-submodules.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GitError(f"Không đọc được {path}: {exc}") from exc
+    if not isinstance(data, dict) or not all(isinstance(value, dict) for value in data.values()):
+        raise GitError(f"Định dạng {path} không hợp lệ.")
+    for branch_rules in data.values():
+        if not all(isinstance(rule, (str, dict)) for rule in branch_rules.values()):
+            raise GitError(f"Định dạng {path} không hợp lệ.")
+    return data
+
+
+def rules_for(all_rules, main_branch):
+    return {path: normalize_rule(value) for path, value in all_rules.get(main_branch, {}).items()}
+
+
+def save_submodule_rules(repo, rules):
+    path = os.path.join(repo, ".gitsp-submodules.json")
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(rules, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+    except OSError as exc:
+        raise GitError(f"Không ghi được {path}: {exc}") from exc
+
+
+def branch_exists(repo, branch):
+    return git_run(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")[0] == 0 or git_run(
+        repo, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"
+    )[0] == 0
+
+
+def checkout_branch(repo, branch):
+    if git_run(repo, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}")[0] == 0:
+        git_ok(repo, "checkout", branch)
+        return
+    if git_run(repo, "show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}")[0] == 0:
+        git_ok(repo, "checkout", "-b", branch, "--track", f"origin/{branch}")
+        return
+    raise GitError(f"Repo '{repo}' không có branch '{branch}'.")
+
+
+def list_files(repo, branch):
+    raw = git_ok(repo, "ls-tree", "-r", "-z", "--name-only", branch)
+    return sorted(path for path in decode_utf8(raw).split("\0") if path)
+
+
+def copy_files_from_branch(repo, branch, paths):
+    for path in paths:
+        content = git_ok(repo, "cat-file", "blob", f"{branch}:{path}")
+        target = os.path.join(repo, *path.split("/"))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as handle:
+            handle.write(content)
+
+
+def read_log(repo, *args):
+    raw = decode_utf8(git_ok(repo, "log", DATE_FORMAT, LOG_FORMAT, *args))
+    commits = []
+    for line in raw.splitlines():
+        full, short, when, author, subject = line.split(SEP, 4)
+        commits.append((full, short, when, author, subject))
+    return commits
+
+
+def commits_in_period(repo, branch, since, until):
+    return read_log(repo, f"--since={since} 00:00:00", f"--until={until} 23:59:59", branch)
+
+
+def commits_missing_in_target(repo, source, target):
+    return read_log(repo, "--no-merges", "--reverse", "--cherry-pick", "--right-only", f"{target}...{source}")
+
+
+def working_tree_dirty(repo):
+    return bool(git_ok(repo, "status", "--porcelain", "--untracked-files=no").strip())
+
+
+def cherry_pick_in_progress(repo):
+    return git_run(repo, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD")[0] == 0
+
+
+def list_local_branches(repo):
+    raw = git_ok(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads")
+    return sorted(line for line in decode_utf8(raw).splitlines() if line)
+
+
+def original_message(repo, sha):
+    raw = git_ok(repo, "log", "-1", "--format=%B", sha)
+    return decode_utf8(raw).rstrip("\n")
+
+
+def ensure_not_protected(branch):
+    if not branch:
+        raise GitError("Chưa chọn branch.")
+    if branch in PROTECTED_BRANCHES:
+        raise GitError(
+            f"Branch '{branch}' là branch được bảo vệ, không rewrite hay force update (xem pranj-ctrl.md mục 8)."
+        )
+
+
+def rewrite_messages(repo, branch, first_sha, overrides):
+    if git_run(repo, "merge-base", "--is-ancestor", first_sha, f"refs/heads/{branch}")[0] != 0:
+        raise GitError("Commit không còn nằm trên branch, hãy tải lại danh sách.")
+    old_tip = decode_utf8(git_ok(repo, "rev-parse", f"refs/heads/{branch}")).strip()
+    rows = git_ok(
+        repo, "rev-list", "--reverse", "--topo-order", "--parents", "--ancestry-path", f"{first_sha}..{old_tip}"
+    ).decode("utf-8", errors="replace").splitlines()
+    first_row = decode_utf8(git_ok(repo, "rev-list", "--parents", "-n", "1", first_sha)).split()
+    chain = [first_row] + [line.split() for line in rows if line.strip()]
+
+    for index, (sha, *parents) in enumerate(chain):
+        if len(parents) > 1:
+            raise GitError("Vùng cần viết lại có merge commit, chưa hỗ trợ.")
+        if index and parents != [chain[index - 1][0]]:
+            raise GitError("Lịch sử không tuyến tính trong vùng cần viết lại.")
+
+    new_parent = chain[0][1] if len(chain[0]) > 1 else None
+    for sha, *_ in chain:
+        header, _, body = git_ok(repo, "cat-file", "commit", sha).partition(b"\n\n")
+        tree = None
+        author = None
+        for line in header.split(b"\n"):
+            if line.startswith(b"tree "):
+                tree = line[5:].decode("utf-8", errors="replace")
+            elif line.startswith(b"author "):
+                author = RAW_AUTHOR.match(line)
+        if tree is None or author is None:
+            raise GitError(f"Không đọc được commit {sha[:8]}.")
+
+        message = overrides.get(sha)
+        message_bytes = message.rstrip().encode("utf-8") + b"\n" if message is not None else body
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": author.group(1).decode("utf-8", errors="replace"),
+            "GIT_AUTHOR_EMAIL": author.group(2).decode("utf-8", errors="replace"),
+            "GIT_AUTHOR_DATE": decode_utf8(author.group(3)),
+        }
+        args = ["commit-tree", tree]
+        if new_parent:
+            args += ["-p", new_parent]
+        args += ["-F", "-"]
+        code, out, err = git_run(repo, *args, env=env, stdin=message_bytes)
+        if code:
+            raise GitError((err or out).decode("utf-8", errors="replace").strip())
+        new_parent = decode_utf8(out).strip()
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_ref = f"refs/backup/{branch}/{stamp}"
+    git_ok(repo, "update-ref", backup_ref, old_tip)
+    git_ok(repo, "update-ref", "-m", "gitsp: rewrite commit messages", f"refs/heads/{branch}", new_parent, old_tip)
+    return len(chain), backup_ref
+
+
+def is_ancestor(repo, ancestor, descendant):
+    return git_run(repo, "merge-base", "--is-ancestor", ancestor, descendant)[0] == 0
+
+
+def remote_is_known(repo, branch, remote_sha):
+    if is_ancestor(repo, remote_sha, f"refs/heads/{branch}"):
+        return True
+    backups = decode_utf8(git_ok(repo, "for-each-ref", "--format=%(refname)", f"refs/backup/{branch}/")).split()
+    return any(is_ancestor(repo, remote_sha, ref) for ref in backups)
+
+
+def force_update_remote(repo, branch):
+    git_ok(repo, "fetch", "origin")
+    remote_ref = f"refs/remotes/origin/{branch}"
+    code, out, _ = git_run(repo, "rev-parse", "--verify", "-q", remote_ref)
+    if code:
+        raise GitError(f"origin chưa có branch '{branch}', không cần force update.")
+    remote_sha = decode_utf8(out).strip()
+    local_sha = decode_utf8(git_ok(repo, "rev-parse", f"refs/heads/{branch}")).strip()
+    if local_sha == remote_sha:
+        raise GitError("Local và origin đã giống nhau, không có gì để force update.")
+    if not remote_is_known(repo, branch, remote_sha):
+        raise GitError(
+            f"origin/{branch} có commit không nằm trong lịch sử local hoặc backup, force update sẽ làm mất chúng. "
+            "Hãy xử lý theo pranj-ctrl.md mục 10 trước."
+        )
+    code, out, err = git_run(
+        repo,
+        "push",
+        f"--force-with-lease=refs/heads/{branch}:{remote_sha}",
+        "origin",
+        f"refs/heads/{branch}:refs/heads/{branch}",
+    )
+    text = (out + err).decode("utf-8", errors="replace").strip()
+    if code:
+        raise GitError(text or "git push thất bại.")
+    return text
+
+
+COMMIT_TYPES = (
+    ("feat", "Thêm năng lực hoặc hành vi mới"),
+    ("fix", "Sửa lỗi, sai so với yêu cầu, regression"),
+    ("docs", "Chỉ cập nhật tài liệu"),
+    ("chore", "Bảo trì, tooling, cấu hình, build"),
+    ("struct", "Tổ chức lại cấu trúc tài liệu hoặc thư mục"),
+    ("test", "Thêm hoặc sửa test case"),
+    ("reft", "Refactor, không đổi hành vi"),
+    ("sub-feat", "Commit trên branch sub-feat theo version"),
+    ("app", "Thay đổi trong app hoặc testobj riêng"),
+    ("release", "Thay đổi trên branch release"),
+)
+
+
+def build_commit_message(ctype, scope, name, subject):
+    head = ctype
+    if scope.strip():
+        head += f"({scope.strip()})"
+    if name.strip():
+        head += f"[{name.strip()}]"
+    return f"{head}: {subject.strip().rstrip('.') or '<subject>'}"
+
+
+COMMENT_TAGS = (
+    ("NOTE", "Ghi chú bổ sung cho task hoặc đoạn phía trên"),
+    ("STATUS", "Tiến độ hiện tại, kết quả đã đạt hoặc lý do đóng task"),
+    ("CRITICAL", "Ràng buộc, cảnh báo hoặc thay đổi phạm vi quan trọng"),
+    ("REVIEW", "Nội dung cần review hoặc thống nhất với người khác"),
+    ("DEPRECATED", "Nội dung đã bỏ, giữ lại để tham chiếu"),
+    ("FIXME", "Vấn đề tồn đọng cần sửa"),
+    ("LINK", "Liên kết tới file hoặc dòng code liên quan"),
+)
+
+TICKET_PREFIXES = ("ARCH", "CORE", "DOCS", "PLTF", "REPO", "TEST")
+TODO_RELPATH = ("docs", "to-do.md")
+
+
+def build_comment(tag, text, inline):
+    body = text.strip() or "<nội dung>"
+    if inline:
+        return f"//{tag} - {body}"
+    return f"<!-- {tag}\n{body}\n-->"
+
+
+def build_ticket(done, deprecated, epic, prefix, number, text):
+    marker = "DEPRECATED" if deprecated else "TID"
+    if epic.strip():
+        marker += f"[epic={epic.strip()}]"
+    number = f"{int(number):03d}" if number.strip().isdigit() else (number.strip() or "NNN")
+    mark = "x" if done else " "
+    return f"- [{mark}] @! {marker} {prefix}-{number} <+ {text.strip() or '<mô tả>'}"
+
+
+def read_todo(todo_path):
+    try:
+        with open(todo_path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as exc:
+        raise GitError(f"Không đọc được {todo_path}: {exc}") from exc
+
+
+def list_versions(todo_path):
+    return re.findall(r"^### Phiên bản (\d+\.\d+\.\d+):", read_todo(todo_path), re.M)
+
+
+def version_section(content, version):
+    lines = content.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith(f"### Phiên bản {version}:")), None)
+    if start is None:
+        return ""
+    for end in range(start + 1, len(lines)):
+        if lines[end].startswith(("### ", "## ")):
+            return "\n".join(lines[start:end])
+    return "\n".join(lines[start:])
+
+
+def next_ticket_number(todo_path, prefix, version):
+    section = version_section(read_todo(todo_path), version)
+    numbers = [int(num) for pfx, num in re.findall(r"\b([A-Z]+)-(\d{3})\b", section) if pfx == prefix]
+    return f"{max(numbers, default=0) + 1:03d}"
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.option_add("*Font", (UI_FONT, 10))
+        self.option_add("*Entry.font", (UI_FONT, 10))
+        self.option_add("*Text.font", (UI_FONT, 10))
+        self.option_add("*Listbox.font", (UI_FONT, 10))
+        self.title("gitps - Git Support Tool")
+        self.geometry("1600x900")
+        self.minsize(1280, 720)
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.repo_var = tk.StringVar(value=detect_repo(script_dir))
+        self.current_var = tk.StringVar(value="-")
+        self.source_var = tk.StringVar()
+        self.period_branch_var = tk.StringVar()
+        self.filter_var = tk.StringVar()
+        self.since_var = tk.StringVar(value=(date.today() - timedelta(days=7)).isoformat())
+        self.until_var = tk.StringVar(value=date.today().isoformat())
+        self.status_var = tk.StringVar(value="Sẵn sàng")
+        self.current_name = ""
+        self.all_files = []
+        self.visible_files = []
+        self.rw_branch_var = tk.StringVar()
+        self.rw_pending = {}
+        self.rw_commits = []
+        self.submodule_main_branch_var = tk.StringVar()
+        self.submodule_branch_var = tk.StringVar()
+        self.submodule_commit_var = tk.StringVar()
+        self.submodule_path_var = tk.StringVar()
+        self.submodule_rules = {}
+        self.submodule_entries = []
+        self.ctype_var = tk.StringVar(value="feat")
+        self.commit_scope_var = tk.StringVar()
+        self.commit_name_var = tk.StringVar()
+        self.commit_subject_var = tk.StringVar()
+        self.commit_preview_var = tk.StringVar()
+        for var in (self.ctype_var, self.commit_scope_var, self.commit_name_var, self.commit_subject_var):
+            var.trace_add("write", lambda *_: self.update_commit_preview())
+        self.doc_mode_var = tk.StringVar(value="note")
+        self.note_tag_var = tk.StringVar(value="NOTE")
+        self.note_inline_var = tk.BooleanVar(value=False)
+        self.note_desc_var = tk.StringVar()
+        self.ticket_done_var = tk.BooleanVar(value=False)
+        self.ticket_deprecated_var = tk.BooleanVar(value=False)
+        self.ticket_epic_var = tk.StringVar()
+        self.ticket_version_var = tk.StringVar()
+        self.ticket_prefix_var = tk.StringVar(value="DOCS")
+        self.ticket_number_var = tk.StringVar()
+        self.ticket_text_var = tk.StringVar()
+        self.doc_preview_var = tk.StringVar()
+        for var in (
+            self.note_tag_var,
+            self.note_inline_var,
+            self.ticket_done_var,
+            self.ticket_deprecated_var,
+            self.ticket_epic_var,
+            self.ticket_prefix_var,
+            self.ticket_number_var,
+            self.ticket_text_var,
+        ):
+            var.trace_add("write", lambda *_: self.update_doc_preview())
+
+        self._build_log()
+        self._build_header()
+        self._build_tabs()
+        self.update_commit_preview()
+        self.guarded(self.refresh_branches)
+
+    def _build_log(self):
+        bottom = ttk.Frame(self, padding=(8, 0, 8, 8))
+        bottom.pack(fill="x", side="bottom")
+        self.log_text = tk.Text(bottom, height=8, wrap="word", state="disabled")
+        self.log_text.pack(fill="both", expand=True)
+        ttk.Label(bottom, textvariable=self.status_var).pack(anchor="w", pady=(4, 0))
+
+    def _build_header(self):
+        header = ttk.Frame(self, padding=8)
+        header.pack(fill="x")
+        header.columnconfigure(1, weight=1)
+
+        ttk.Label(header, text="Repo:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(header, textvariable=self.repo_var).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(header, text="Chọn...", command=lambda: self.guarded(self.choose_repo)).grid(row=0, column=2)
+        ttk.Button(header, text="Làm mới branch", command=lambda: self.guarded(self.refresh_branches)).grid(
+            row=0, column=3, padx=(4, 0)
+        )
+
+        ttk.Label(header, text="Branch hiện tại (B):").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(header, textvariable=self.current_var, font=(UI_FONT, 10, "bold")).grid(
+            row=1, column=1, sticky="w", pady=(6, 0)
+        )
+
+        ttk.Label(header, text="Branch nguồn (A):").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.source_combo = ttk.Combobox(header, textvariable=self.source_var, state="readonly")
+        self.source_combo.grid(row=2, column=1, sticky="ew", padx=4, pady=(6, 0))
+        self.source_combo.bind("<<ComboboxSelected>>", lambda _event: self.guarded(self.load_files))
+
+    def _build_tabs(self):
+        notebook = ttk.Notebook(self)
+        notebook.pack(fill="both", expand=True, padx=8, pady=4)
+        self._build_files_tab(notebook)
+        self._build_period_tab(notebook)
+        self._build_cherry_tab(notebook)
+        self._build_commit_tab(notebook)
+        self._build_doc_tab(notebook)
+        self._build_rewrite_tab(notebook)
+        self._build_submodule_tab(notebook)
+
+    def _build_files_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Lấy file từ A")
+
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        ttk.Label(top, text="Lọc đường dẫn:").pack(side="left")
+        ttk.Entry(top, textvariable=self.filter_var).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(top, text="Tải file của A", command=lambda: self.guarded(self.load_files)).pack(side="left")
+
+        list_frame = ttk.Frame(tab)
+        list_frame.pack(fill="both", expand=True, pady=6)
+        scroll = ttk.Scrollbar(list_frame, orient="vertical")
+        self.file_list = tk.Listbox(
+            list_frame, selectmode="extended", yscrollcommand=scroll.set, exportselection=False
+        )
+        scroll.config(command=self.file_list.yview)
+        self.file_list.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.filter_var.trace_add("write", lambda *_: self.render_files())
+
+        ttk.Button(
+            tab,
+            text="Lấy file đã chọn từ A vào working tree (B)",
+            command=lambda: self.guarded(self.copy_selected_files),
+        ).pack(anchor="e")
+
+    def _build_period_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Commit theo thời gian")
+
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        ttk.Label(top, text="Branch:").pack(side="left")
+        self.period_combo = ttk.Combobox(
+            top, textvariable=self.period_branch_var, state="readonly", width=34
+        )
+        self.period_combo.pack(side="left", padx=4)
+        ttk.Label(top, text="Từ (YYYY-MM-DD):").pack(side="left", padx=(12, 0))
+        ttk.Entry(top, textvariable=self.since_var, width=12).pack(side="left", padx=4)
+        ttk.Label(top, text="Đến (YYYY-MM-DD):").pack(side="left", padx=(12, 0))
+        ttk.Entry(top, textvariable=self.until_var, width=12).pack(side="left", padx=4)
+        ttk.Button(top, text="Lấy commit", command=lambda: self.guarded(self.load_period_commits)).pack(
+            side="left", padx=(12, 0)
+        )
+
+        self.period_tree = self._make_commit_tree(tab)
+
+    def _build_cherry_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Cherry-pick")
+
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        ttk.Label(top, text="Commit có trong A nhưng chưa có trong B (chọn nhiều bằng Ctrl/Shift):").pack(
+            side="left"
+        )
+        ttk.Button(top, text="Tải danh sách", command=lambda: self.guarded(self.load_cherry_candidates)).pack(
+            side="right"
+        )
+
+        self.cherry_tree = self._make_commit_tree(tab)
+        ttk.Button(
+            tab,
+            text="Cherry-pick đã chọn vào B (branch hiện tại)",
+            command=lambda: self.guarded(self.cherry_pick_selected),
+        ).pack(anchor="e", pady=(8, 0))
+
+    def _build_commit_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Mẫu commit")
+
+        form = ttk.Frame(tab)
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, text="Loại:").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(
+            form,
+            textvariable=self.ctype_var,
+            values=[code for code, _ in COMMIT_TYPES],
+            state="readonly",
+            width=12,
+        ).grid(row=0, column=1, sticky="w", padx=4)
+        ttk.Label(form, text="Scope:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(form, textvariable=self.commit_scope_var).grid(row=1, column=1, sticky="ew", padx=4, pady=(6, 0))
+        ttk.Label(form, text="Tên [name]:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(form, textvariable=self.commit_name_var).grid(row=2, column=1, sticky="ew", padx=4, pady=(6, 0))
+        ttk.Label(form, text="Subject:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(form, textvariable=self.commit_subject_var).grid(row=3, column=1, sticky="ew", padx=4, pady=(6, 0))
+
+        preview = ttk.Frame(tab)
+        preview.pack(fill="x", pady=(10, 0))
+        ttk.Label(preview, text="Xem trước:").pack(side="left")
+        ttk.Label(preview, textvariable=self.commit_preview_var, font=(MONO_FONT, 10, "bold")).pack(
+            side="left", padx=6
+        )
+        ttk.Button(
+            preview,
+            text="Copy vào clipboard",
+            command=lambda: self.guarded(self.copy_commit_message),
+        ).pack(side="right")
+
+        frame = ttk.Frame(tab)
+        frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.type_tree = ttk.Treeview(
+            frame, columns=("type", "desc", "template"), show="headings", selectmode="browse"
+        )
+        for column, title, width in (
+            ("type", "Loại", 90),
+            ("desc", "Dùng khi", 300),
+            ("template", "Mẫu", 420),
+        ):
+            self.type_tree.heading(column, text=title)
+            self.type_tree.column(column, width=width, stretch=column == "template")
+        for code, desc in COMMIT_TYPES:
+            self.type_tree.insert(
+                "", "end", iid=code, values=(code, desc, f"{code}(<scope>)[<name>]: <subject>")
+            )
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.type_tree.yview)
+        self.type_tree.configure(yscrollcommand=scroll.set)
+        self.type_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.type_tree.bind("<<TreeviewSelect>>", self.select_commit_type)
+
+    def select_commit_type(self, _event=None):
+        selection = self.type_tree.selection()
+        if selection:
+            self.ctype_var.set(selection[0])
+
+    def update_commit_preview(self):
+        self.commit_preview_var.set(
+            build_commit_message(
+                self.ctype_var.get(),
+                self.commit_scope_var.get(),
+                self.commit_name_var.get(),
+                self.commit_subject_var.get(),
+            )
+        )
+
+    def copy_commit_message(self):
+        if not self.commit_subject_var.get().strip():
+            self.log("Nhập subject trước khi copy.")
+            return
+        message = self.commit_preview_var.get()
+        self.clipboard_clear()
+        self.clipboard_append(message)
+        self.log(f"Đã copy: {message}")
+
+    def _build_doc_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Ghi chú & ticket")
+
+        mode_row = ttk.Frame(tab)
+        mode_row.pack(fill="x")
+        ttk.Label(mode_row, text="Chế độ:").pack(side="left")
+        for value, label in (("note", "Ghi chú tài liệu"), ("ticket", "Ticket to-do")):
+            ttk.Radiobutton(
+                mode_row, text=label, value=value, variable=self.doc_mode_var, command=self.switch_doc_mode
+            ).pack(side="left", padx=8)
+
+        self.doc_panel = ttk.Frame(tab)
+        self.doc_panel.pack(fill="both", expand=True, pady=(8, 0))
+        self.note_frame = ttk.Frame(self.doc_panel)
+        self.ticket_frame = ttk.Frame(self.doc_panel)
+        self._build_note_form(self.note_frame)
+        self._build_ticket_form(self.ticket_frame)
+
+        preview = ttk.Frame(tab)
+        preview.pack(fill="x", pady=(10, 0))
+        ttk.Label(preview, text="Xem trước:").pack(side="left")
+        ttk.Label(preview, textvariable=self.doc_preview_var, font=(MONO_FONT, 10, "bold")).pack(
+            side="left", padx=6
+        )
+        ttk.Button(
+            preview,
+            text="Copy vào clipboard",
+            command=lambda: self.guarded(self.copy_doc_text),
+        ).pack(side="right")
+
+        self.switch_doc_mode()
+
+    def _build_note_form(self, parent):
+        top = ttk.Frame(parent)
+        top.pack(fill="x")
+        ttk.Label(top, text="Tag:").pack(side="left")
+        ttk.Combobox(
+            top,
+            textvariable=self.note_tag_var,
+            values=[code for code, _ in COMMENT_TAGS],
+            state="readonly",
+            width=12,
+        ).pack(side="left", padx=4)
+        ttk.Checkbutton(
+            top, text="Dạng inline //TAG - ... (bỏ chọn = block <!-- -->)", variable=self.note_inline_var
+        ).pack(side="left", padx=12)
+        ttk.Label(parent, textvariable=self.note_desc_var, foreground="gray").pack(anchor="w", pady=(6, 0))
+        ttk.Label(parent, text="Nội dung (có thể nhiều dòng):").pack(anchor="w", pady=(8, 0))
+        self.note_text = tk.Text(parent, height=8, wrap="word")
+        self.note_text.pack(fill="both", expand=True)
+        self.note_text.bind("<<Modified>>", self._on_note_modified)
+
+    def _build_ticket_form(self, parent):
+        form = ttk.Frame(parent)
+        form.pack(fill="x")
+        form.columnconfigure(1, weight=1)
+        ttk.Checkbutton(form, text="Đã hoàn thành [x]", variable=self.ticket_done_var).grid(
+            row=0, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Checkbutton(form, text="DEPRECATED", variable=self.ticket_deprecated_var).grid(
+            row=1, column=0, columnspan=2, sticky="w"
+        )
+        ttk.Label(form, text="Phiên bản:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        self.version_combo = ttk.Combobox(
+            form, textvariable=self.ticket_version_var, state="readonly", width=12
+        )
+        self.version_combo.grid(row=2, column=1, sticky="w", padx=4, pady=(6, 0))
+        self.version_combo.bind("<<ComboboxSelected>>", lambda _event: self.guarded(self.suggest_ticket_number))
+        ttk.Label(form, text="Epic:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(form, textvariable=self.ticket_epic_var).grid(row=3, column=1, sticky="ew", padx=4, pady=(6, 0))
+        ttk.Label(form, text="Prefix:").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        prefix_box = ttk.Combobox(
+            form, textvariable=self.ticket_prefix_var, values=TICKET_PREFIXES, state="readonly", width=10
+        )
+        prefix_box.grid(row=4, column=1, sticky="w", padx=4, pady=(6, 0))
+        prefix_box.bind("<<ComboboxSelected>>", lambda _event: self.guarded(self.suggest_ticket_number))
+        ttk.Label(form, text="Số:").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        number_row = ttk.Frame(form)
+        number_row.grid(row=5, column=1, sticky="ew", padx=4, pady=(6, 0))
+        ttk.Entry(number_row, textvariable=self.ticket_number_var, width=8).pack(side="left")
+        ttk.Button(
+            number_row,
+            text="Gợi ý số tiếp theo",
+            command=lambda: self.guarded(self.suggest_ticket_number),
+        ).pack(side="left", padx=6)
+        ttk.Label(form, text="Mô tả:").grid(row=6, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(form, textvariable=self.ticket_text_var).grid(row=6, column=1, sticky="ew", padx=4, pady=(6, 0))
+
+    def switch_doc_mode(self):
+        is_note = self.doc_mode_var.get() == "note"
+        self.note_frame.pack_forget()
+        self.ticket_frame.pack_forget()
+        if is_note:
+            self.note_frame.pack(fill="both", expand=True)
+        else:
+            self.ticket_frame.pack(fill="x")
+            if not self.ticket_number_var.get().strip() and self.ticket_version_var.get():
+                self.guarded(self.suggest_ticket_number)
+        self.update_doc_preview()
+
+    def todo_path(self):
+        return os.path.join(self.repo(), *TODO_RELPATH)
+
+    def refresh_versions(self):
+        try:
+            versions = list_versions(self.todo_path())
+        except GitError:
+            versions = []
+        self.version_combo.configure(values=list(reversed(versions)))
+        match = re.search(r"Rv?(\d+\.\d+\.\d+)", self.current_name)
+        guess = match.group(1) if match else ""
+        if self.ticket_version_var.get() not in versions:
+            self.ticket_version_var.set(guess if guess in versions else (versions[-1] if versions else ""))
+
+    def suggest_ticket_number(self):
+        version = self.ticket_version_var.get()
+        if not version:
+            raise GitError("Chưa chọn phiên bản.")
+        prefix = self.ticket_prefix_var.get()
+        number = next_ticket_number(self.todo_path(), prefix, version)
+        self.ticket_number_var.set(number)
+        self.log(f"Số tiếp theo cho {prefix} ở phiên bản {version}: {number}")
+
+    def _on_note_modified(self, _event=None):
+        if self.note_text.edit_modified():
+            self.note_text.edit_modified(False)
+            self.update_doc_preview()
+
+    def update_doc_preview(self):
+        if self.doc_mode_var.get() == "note":
+            tag = self.note_tag_var.get()
+            self.note_desc_var.set(dict(COMMENT_TAGS).get(tag, ""))
+            self.doc_preview_var.set(
+                build_comment(tag, self.note_text.get("1.0", "end"), self.note_inline_var.get())
+            )
+        else:
+            self.doc_preview_var.set(
+                build_ticket(
+                    self.ticket_done_var.get(),
+                    self.ticket_deprecated_var.get(),
+                    self.ticket_epic_var.get(),
+                    self.ticket_prefix_var.get(),
+                    self.ticket_number_var.get(),
+                    self.ticket_text_var.get(),
+                )
+            )
+
+    def copy_doc_text(self):
+        if self.doc_mode_var.get() == "note":
+            if not self.note_text.get("1.0", "end").strip():
+                self.log("Nhập nội dung ghi chú trước khi copy.")
+                return
+        else:
+            if not self.ticket_text_var.get().strip():
+                self.log("Nhập mô tả ticket trước khi copy.")
+                return
+            if not self.ticket_number_var.get().strip().isdigit():
+                self.log("Số ticket phải là số, bấm 'Gợi ý số tiếp theo'.")
+                return
+        text = self.doc_preview_var.get()
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.log(f"Đã copy: {text.splitlines()[0]}")
+
+    def _build_rewrite_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Rewrite & force update")
+
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        ttk.Label(top, text="Branch:").pack(side="left")
+        self.rewrite_combo = ttk.Combobox(top, textvariable=self.rw_branch_var, state="readonly", width=34)
+        self.rewrite_combo.pack(side="left", padx=4)
+        ttk.Button(
+            top, text="Tải 100 commit gần nhất", command=lambda: self.guarded(self.load_rewrite_commits)
+        ).pack(side="left", padx=(8, 0))
+
+        frame = ttk.Frame(tab)
+        frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.rewrite_tree = ttk.Treeview(
+            frame,
+            columns=("mark", "hash", "date", "author", "subject"),
+            show="headings",
+            selectmode="browse",
+            height=8,
+        )
+        for column, title, width in (
+            ("mark", "Đã sửa", 70),
+            ("hash", "Hash", 80),
+            ("date", "Ngày", 130),
+            ("author", "Tác giả", 140),
+            ("subject", "Nội dung", 440),
+        ):
+            self.rewrite_tree.heading(column, text=title)
+            self.rewrite_tree.column(column, width=width, stretch=column == "subject")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.rewrite_tree.yview)
+        self.rewrite_tree.configure(yscrollcommand=scroll.set)
+        self.rewrite_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.rewrite_tree.bind("<<TreeviewSelect>>", lambda _event: self.guarded(self.load_selected_message))
+
+        ttk.Label(tab, text="Message đầy đủ của commit đang chọn:").pack(anchor="w", pady=(8, 0))
+        self.rw_text = tk.Text(tab, height=7, wrap="word")
+        self.rw_text.pack(fill="x")
+
+        actions = ttk.Frame(tab)
+        actions.pack(fill="x", pady=(6, 0))
+        ttk.Button(
+            actions,
+            text="Dùng dòng đầu từ tab Mẫu commit",
+            command=lambda: self.guarded(self.apply_template_to_message),
+        ).pack(side="left")
+        ttk.Button(actions, text="Lưu sửa", command=lambda: self.guarded(self.save_rewrite_message)).pack(
+            side="left", padx=6
+        )
+        ttk.Button(actions, text="Bỏ sửa commit này", command=lambda: self.guarded(self.reset_rewrite_message)).pack(
+            side="left"
+        )
+        ttk.Button(
+            actions,
+            text="Force update lên origin",
+            command=lambda: self.guarded(self.force_update_origin),
+        ).pack(side="right")
+        ttk.Button(
+            actions,
+            text="Viết lại message (local)",
+            command=lambda: self.guarded(self.rewrite_local_messages),
+        ).pack(side="right", padx=6)
+
+    def _build_submodule_tab(self, notebook):
+        tab = ttk.Frame(notebook, padding=8)
+        notebook.add(tab, text="Submodule & ràng buộc")
+
+        top = ttk.Frame(tab)
+        top.pack(fill="x")
+        ttk.Label(top, text="Branch repo chính:").pack(side="left")
+        self.submodule_main_combo = ttk.Combobox(
+            top, textvariable=self.submodule_main_branch_var, state="readonly", width=34
+        )
+        self.submodule_main_combo.pack(side="left", padx=4)
+        self.submodule_main_combo.bind(
+            "<<ComboboxSelected>>", lambda _event: self.guarded(self.load_submodule_state)
+        )
+        ttk.Button(top, text="Kiểm tra submodule", command=lambda: self.guarded(self.load_submodule_state)).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(top, text="Lưu ràng buộc", command=lambda: self.guarded(self.save_current_submodule_rule)).pack(
+            side="left", padx=4
+        )
+        ttk.Button(
+            top, text="Chuyển branch theo ràng buộc", command=lambda: self.guarded(self.switch_with_submodules)
+        ).pack(side="right")
+        ttk.Button(top, text="Kiểm tra migration", command=lambda: self.guarded(self.show_migration_audit)).pack(
+            side="right", padx=(0, 8)
+        )
+        ttk.Button(
+            top, text="Chuyển sang submodule", command=lambda: self.guarded(self.convert_folder_to_submodule_ui)
+        ).pack(side="right", padx=(0, 8))
+
+        frame = ttk.Frame(tab)
+        frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.submodule_tree = ttk.Treeview(
+            frame, columns=("path", "current", "sha", "required", "state"), show="headings", selectmode="browse"
+        )
+        for column, title, width in (
+            ("path", "Submodule", 300),
+            ("current", "Branch hiện tại", 160),
+            ("sha", "Commit hiện tại", 100),
+            ("required", "Ràng buộc", 200),
+            ("state", "Trạng thái", 240),
+        ):
+            self.submodule_tree.heading(column, text=title)
+            self.submodule_tree.column(column, width=width, stretch=column == "path")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.submodule_tree.yview)
+        self.submodule_tree.configure(yscrollcommand=scroll.set)
+        self.submodule_tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.submodule_tree.bind("<<TreeviewSelect>>", self.select_submodule)
+
+        form = ttk.Frame(tab)
+        form.pack(fill="x", pady=(8, 0))
+        ttk.Label(form, text="Submodule đã chọn:").pack(side="left")
+        ttk.Label(form, textvariable=self.submodule_path_var).pack(side="left", padx=4)
+        ttk.Label(form, text="Branch:").pack(side="left", padx=(16, 0))
+        ttk.Entry(form, textvariable=self.submodule_branch_var, width=26).pack(side="left", padx=4)
+        ttk.Label(form, text="Commit:").pack(side="left", padx=(12, 0))
+        ttk.Entry(form, textvariable=self.submodule_commit_var, width=14).pack(side="left", padx=4)
+        ttk.Button(
+            form, text="Lấy commit hiện tại", command=lambda: self.guarded(self.fill_current_submodule_commit)
+        ).pack(side="left", padx=4)
+        ttk.Button(form, text="Xóa ràng buộc", command=lambda: self.guarded(self.delete_current_submodule_rule)).pack(
+            side="left", padx=4
+        )
+
+        ttk.Label(
+            tab,
+            text=(
+                "Chỉ branch: checkout branch. Chỉ commit: checkout detached tại commit. "
+                "Cả hai: checkout branch và yêu cầu đầu branch đúng commit. "
+                "Ràng buộc được lưu trong .gitsp-submodules.json và nên được commit cùng repo chính."
+            ),
+            foreground="gray",
+            wraplength=900,
+            justify="left",
+        ).pack(anchor="w", pady=(8, 0))
+
+    def load_submodule_state(self):
+        repo = self.repo()
+        branches = list_local_branches(repo)
+        self.submodule_main_combo.configure(values=branches)
+        main_branch = self.submodule_main_combo.get()
+        if main_branch not in branches:
+            main_branch = self.current_name if self.current_name in branches else (branches[0] if branches else "")
+            self.submodule_main_combo.set(main_branch)
+        self.submodule_rules = load_submodule_rules(repo)
+        self.submodule_entries = list_submodules(repo)
+        self.submodule_tree.delete(*self.submodule_tree.get_children())
+        rules = rules_for(self.submodule_rules, main_branch)
+        for entry in self.submodule_entries:
+            rule = rules.get(entry["path"])
+            if not rule:
+                state = "Thiếu ràng buộc"
+            elif rule_satisfied(entry, rule):
+                state = "Đúng ràng buộc"
+            elif rule["branch"] and entry["branch"] != rule["branch"]:
+                state = "Lệch branch"
+            else:
+                state = "Lệch commit"
+            if entry["dirty"]:
+                state += "; working tree bẩn"
+            self.submodule_tree.insert(
+                "",
+                "end",
+                iid=entry["path"],
+                values=(
+                    entry["path"],
+                    entry["branch"] or "(detached)",
+                    entry["sha"][:8],
+                    describe_rule(rule) if rule else "",
+                    state,
+                ),
+            )
+        self.submodule_path_var.set("")
+        self.submodule_branch_var.set("")
+        self.submodule_commit_var.set("")
+        self.log(f"Đã kiểm tra {len(self.submodule_entries)} submodule trên branch {main_branch or '(chưa chọn)'}.")
+
+    def select_submodule(self, _event=None):
+        selection = self.submodule_tree.selection()
+        if not selection:
+            return
+        path = selection[0]
+        self.submodule_path_var.set(path)
+        rule = rules_for(self.submodule_rules, self.submodule_main_combo.get()).get(path)
+        self.submodule_branch_var.set(rule["branch"] if rule else "")
+        self.submodule_commit_var.set(rule["commit"] if rule else "")
+
+    def selected_submodule_entry(self):
+        path = self.submodule_path_var.get()
+        entry = next((item for item in self.submodule_entries if item["path"] == path), None)
+        if not entry:
+            raise GitError("Chọn submodule trước.")
+        return entry
+
+    def fill_current_submodule_commit(self):
+        entry = self.selected_submodule_entry()
+        if not entry["initialized"]:
+            raise GitError(f"{entry['path']} chưa khởi tạo.")
+        self.submodule_commit_var.set(decode_utf8(git_ok(entry["repo"], "rev-parse", "HEAD")).strip())
+
+    def save_current_submodule_rule(self):
+        main_branch = self.submodule_main_combo.get()
+        if not main_branch:
+            raise GitError("Chọn branch chính trước.")
+        entry = self.selected_submodule_entry()
+        branch = self.submodule_branch_var.get().strip()
+        commit = self.submodule_commit_var.get().strip()
+        if not branch and not commit:
+            raise GitError("Nhập branch, commit hoặc cả hai.")
+        if commit:
+            if not entry["initialized"]:
+                raise GitError(f"{entry['path']} chưa khởi tạo, không kiểm tra được commit.")
+            full = resolve_commit(entry["repo"], commit)
+            if not full:
+                raise GitError(f"Commit '{commit}' không có trong {entry['path']}. Hãy fetch submodule trước.")
+            commit = full
+        rule = {"branch": branch, "commit": commit}
+        if entry["initialized"]:
+            problems = rule_problems(entry["path"], entry["repo"], rule)
+            if problems and not messagebox.askyesno(
+                "Ràng buộc chưa thỏa", "\n".join(problems) + "\n\nVẫn lưu ràng buộc này?"
+            ):
+                return
+        self.submodule_rules.setdefault(main_branch, {})[entry["path"]] = encode_rule(branch, commit)
+        save_submodule_rules(self.repo(), self.submodule_rules)
+        self.load_submodule_state()
+        self.log(f"Đã lưu ràng buộc {main_branch} -> {entry['path']}: {describe_rule(rule)}.")
+
+    def delete_current_submodule_rule(self):
+        main_branch = self.submodule_main_combo.get()
+        path = self.submodule_path_var.get()
+        if path not in self.submodule_rules.get(main_branch, {}):
+            raise GitError("Submodule này chưa có ràng buộc trên branch đã chọn.")
+        if not messagebox.askyesno("Xóa ràng buộc", f"Xóa ràng buộc của {path} trên {main_branch}?"):
+            return
+        del self.submodule_rules[main_branch][path]
+        if not self.submodule_rules[main_branch]:
+            del self.submodule_rules[main_branch]
+        save_submodule_rules(self.repo(), self.submodule_rules)
+        self.load_submodule_state()
+        self.log(f"Đã xóa ràng buộc {main_branch} -> {path}.")
+
+    def switch_with_submodules(self):
+        repo = self.repo()
+        target = self.submodule_main_combo.get()
+        if not target:
+            raise GitError("Chưa chọn branch repo chính.")
+        rules = rules_for(load_submodule_rules(repo), target)
+        plan = plan_submodule_switch(repo, target, rules)
+        if plan["problems"]:
+            raise GitError("Chưa thể chuyển branch:\n- " + "\n- ".join(plan["problems"]))
+        entries = plan["entries"]
+        if (
+            target == self.current_name
+            and not plan["leaving"]
+            and not plan["arriving"]
+            and all(rule_satisfied(entries[path], rules[path]) for path in plan["staying"])
+        ):
+            raise GitError("Repo chính và các submodule đã đúng ràng buộc.")
+        if not messagebox.askyesno(
+            "Xác nhận chuyển branch",
+            f"Chuyển repo chính sang '{target}'?\n"
+            f"- Giữ và đồng bộ theo ràng buộc: {len(plan['staying'])}\n"
+            f"- Thêm mới: {len(plan['arriving'])}\n"
+            f"- Gỡ khỏi working tree: {len(plan['leaving'])} (lưu vào .git/gitsp-parked và khôi phục khi quay lại)",
+        ):
+            return
+        parked = apply_submodule_switch(repo, target, rules, plan)
+        self.refresh_branches()
+        self.load_submodule_state()
+        self.log(
+            f"Đã chuyển {target}. Đồng bộ {len(plan['staying'])} submodule, thêm {len(plan['arriving'])}, "
+            f"gỡ {len(plan['leaving'])}."
+        )
+        if parked:
+            self.log("Đã lưu submodule vào .git/gitsp-parked: " + ", ".join(parked))
+
+    def show_migration_audit(self):
+        repo = self.repo()
+        lines = migration_audit(repo)
+        if not lines:
+            raise GitError("Không có branch nào để kiểm tra.")
+        self.log("Kiểm tra migration submodule (mục 14.9):\n" + "\n".join(lines))
+
+    def convert_folder_to_submodule_ui(self):
+        repo = self.repo()
+        branch = self.current_name
+        if not branch:
+            raise GitError("Đang ở detached HEAD, hãy checkout một branch trước.")
+        path = simpledialog.askstring(
+            "Chuyển sang submodule", "Thư mục cần chuyển (ví dụ: pltf):", initialvalue="pltf", parent=self
+        )
+        if path is None:
+            return
+        url = simpledialog.askstring("Chuyển sang submodule", "URL remote của submodule:", parent=self)
+        if url is None:
+            return
+        work_branch = simpledialog.askstring(
+            "Chuyển sang submodule",
+            "Branch làm việc mới (ví dụ sub-chore/pltf-gitlink-<tên>):",
+            initialvalue=f"sub-chore/{path.strip().strip('/')}-gitlink-{branch}",
+            parent=self,
+        )
+        if work_branch is None:
+            return
+        commit_name = simpledialog.askstring("Chuyển sang submodule", "Tên người/nhóm cho commit:", parent=self)
+        if commit_name is None:
+            return
+        if not messagebox.askyesno(
+            "Xác nhận chuyển sang submodule",
+            f"Trên '{branch}', chuyển '{path.strip()}' thành gitlink trỏ tới commit PLTF có cây giống hệt?\n"
+            f"Thao tác tạo branch '{work_branch.strip()}' và một commit. Không push.",
+        ):
+            return
+        pin = convert_folder_to_submodule(repo, path, url, work_branch, commit_name)
+        self.refresh_branches()
+        self.load_submodule_state()
+        self.log(
+            f"Đã chuyển '{path.strip()}' thành gitlink tại {pin[:8]} trên branch {work_branch.strip()}.\n"
+            f"Thư mục cũ được lưu tại {parked_path(repo, path.strip())}. Chưa push, hãy kiểm tra rồi mở PR (mục 14.9)."
+        )
+
+    def load_rewrite_commits(self):
+        repo = self.repo()
+        branch = self.rw_branch_var.get()
+        if not branch:
+            raise GitError("Chưa chọn branch.")
+        self.rw_commits = read_log(repo, "-n", "100", f"refs/heads/{branch}")
+        self.rw_pending.clear()
+        self.rewrite_tree.delete(*self.rewrite_tree.get_children())
+        for full, short, when, author, subject in self.rw_commits:
+            self.rewrite_tree.insert("", "end", iid=full, values=("", short, when, author, subject))
+        self.rw_text.delete("1.0", "end")
+        self.log(f"Đã tải {len(self.rw_commits)} commit của {branch}.")
+
+    def _selected_rewrite_sha(self):
+        selection = self.rewrite_tree.selection()
+        if not selection:
+            raise GitError("Chọn một commit trước.")
+        return selection[0]
+
+    def load_selected_message(self):
+        selection = self.rewrite_tree.selection()
+        if not selection:
+            return
+        sha = selection[0]
+        text = self.rw_pending[sha] if sha in self.rw_pending else original_message(self.repo(), sha)
+        self.rw_text.delete("1.0", "end")
+        self.rw_text.insert("1.0", text)
+
+    def apply_template_to_message(self):
+        self._selected_rewrite_sha()
+        if not self.commit_subject_var.get().strip():
+            raise GitError("Nhập subject ở tab Mẫu commit trước.")
+        line = build_commit_message(
+            self.ctype_var.get(),
+            self.commit_scope_var.get(),
+            self.commit_name_var.get(),
+            self.commit_subject_var.get(),
+        )
+        _, separator, rest = self.rw_text.get("1.0", "end-1c").partition("\n")
+        self.rw_text.delete("1.0", "end")
+        self.rw_text.insert("1.0", line + separator + rest)
+
+    def save_rewrite_message(self):
+        sha = self._selected_rewrite_sha()
+        text = self.rw_text.get("1.0", "end-1c").strip()
+        if not text:
+            raise GitError("Message không được rỗng.")
+        if text == original_message(self.repo(), sha).strip():
+            self.rw_pending.pop(sha, None)
+        else:
+            self.rw_pending[sha] = text
+        self.rewrite_tree.set(sha, "mark", "Đã sửa" if sha in self.rw_pending else "")
+        self.log(f"Đã lưu sửa cho {sha[:8]}. Tổng commit chờ viết lại: {len(self.rw_pending)}.")
+
+    def reset_rewrite_message(self):
+        sha = self._selected_rewrite_sha()
+        self.rw_pending.pop(sha, None)
+        self.rewrite_tree.set(sha, "mark", "")
+        self.load_selected_message()
+
+    def rewrite_local_messages(self):
+        repo = self.repo()
+        branch = self.rw_branch_var.get()
+        ensure_not_protected(branch)
+        if working_tree_dirty(repo):
+            raise GitError("Working tree còn thay đổi đã tracked. Hãy commit hoặc stash trước.")
+        if not self.rw_pending:
+            raise GitError("Chưa có commit nào được lưu sửa message.")
+        order = [full for full, *_ in self.rw_commits]
+        first = max(self.rw_pending, key=order.index)
+        if not messagebox.askyesno(
+            "Xác nhận viết lại",
+            f"Viết lại {len(self.rw_pending)} message, từ commit {first[:8]} tới đầu branch '{branch}'?\n"
+            "Hash của các commit từ đó trở đi sẽ đổi. Branch cũ được backup trong refs/backup/.",
+        ):
+            return
+        count, backup = rewrite_messages(repo, branch, first, self.rw_pending)
+        self.log(f"Đã viết lại {count} commit trên {branch}. Backup: {backup}\n"
+                 f"Khôi phục nếu cần: git branch -f {branch} {backup}")
+        self.load_rewrite_commits()
+
+    def force_update_origin(self):
+        repo = self.repo()
+        branch = self.rw_branch_var.get()
+        ensure_not_protected(branch)
+        typed = simpledialog.askstring(
+            "Xác nhận force update",
+            f"Force update branch '{branch}' lên origin sẽ ghi đè lịch sử remote.\n"
+            f"Nhập đúng tên branch để xác nhận:",
+            parent=self,
+        )
+        if typed is None:
+            return
+        if typed.strip() != branch:
+            raise GitError("Tên branch không khớp, đã hủy force update.")
+        output = force_update_remote(repo, branch)
+        self.log(f"Force update {branch} lên origin thành công.\n{output}")
+        self.load_rewrite_commits()
+
+    def _make_commit_tree(self, parent):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="both", expand=True, pady=(8, 0))
+        tree = ttk.Treeview(
+            frame, columns=("hash", "date", "author", "subject"), show="headings", selectmode="extended"
+        )
+        for column, title, width in (
+            ("hash", "Hash", 80),
+            ("date", "Ngày", 130),
+            ("author", "Tác giả", 160),
+            ("subject", "Nội dung", 500),
+        ):
+            tree.heading(column, text=title)
+            tree.column(column, width=width, stretch=column == "subject")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        return tree
+
+    def _fill_commit_tree(self, tree, commits):
+        tree.delete(*tree.get_children())
+        for full, short, when, author, subject in commits:
+            tree.insert("", "end", iid=full, values=(short, when, author, subject))
+
+    def log(self, message):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", f"[{stamp}] {message}\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+        self.status_var.set(message.splitlines()[0] if message else "")
+
+    def guarded(self, action):
+        try:
+            action()
+        except GitError as exc:
+            self.log(f"Lỗi: {exc}")
+            messagebox.showerror("Lỗi git", str(exc))
+
+    def repo(self):
+        path = self.repo_var.get().strip()
+        if not path:
+            raise GitError("Chưa chọn repo.")
+        return path
+
+    @staticmethod
+    def parse_date(text, label):
+        try:
+            return datetime.strptime(text.strip(), "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            raise GitError(f"Ngày '{label}' không hợp lệ, định dạng YYYY-MM-DD.")
+
+    def choose_repo(self):
+        path = filedialog.askdirectory(
+            initialdir=self.repo_var.get() or None, title="Chọn thư mục git repo"
+        )
+        if path:
+            self.repo_var.set(path)
+            self.refresh_branches()
+
+    def refresh_branches(self):
+        repo = self.repo()
+        branches = list_branches(repo)
+        self.current_name = current_branch(repo)
+        self.current_var.set(self.current_name or "(detached HEAD)")
+        self.source_combo.configure(values=branches)
+        self.period_combo.configure(values=branches)
+        local = list_local_branches(repo)
+        self.rewrite_combo.configure(values=local)
+        if self.rw_branch_var.get() not in local:
+            self.rw_branch_var.set(self.current_name if self.current_name in local else (local[0] if local else ""))
+
+        if self.source_var.get() not in branches:
+            others = [b for b in branches if b != self.current_name]
+            self.source_var.set(others[0] if others else "")
+        if self.period_branch_var.get() not in branches:
+            self.period_branch_var.set(self.current_name or (branches[0] if branches else ""))
+
+        self.log(f"Đã tải {len(branches)} branch. Branch hiện tại: {self.current_name or '(detached HEAD)'}")
+        self.refresh_versions()
+        self.load_files()
+        self.load_submodule_state()
+
+    def load_files(self):
+        source = self.source_var.get()
+        if not source:
+            return
+        self.all_files = list_files(self.repo(), source)
+        self.render_files()
+        self.log(f"Đã tải {len(self.all_files)} file từ {source}.")
+
+    def render_files(self):
+        keyword = self.filter_var.get().strip().lower()
+        self.visible_files = [path for path in self.all_files if keyword in path.lower()]
+        self.file_list.delete(0, "end")
+        for path in self.visible_files:
+            self.file_list.insert("end", path)
+
+    def copy_selected_files(self):
+        repo = self.repo()
+        source = self.source_var.get()
+        if not source:
+            raise GitError("Chưa chọn branch nguồn A.")
+        selected = [self.visible_files[i] for i in self.file_list.curselection()]
+        if not selected:
+            raise GitError("Chưa chọn file nào.")
+
+        overwritten = [p for p in selected if os.path.exists(os.path.join(repo, *p.split("/")))]
+        if overwritten and not messagebox.askyesno(
+            "Xác nhận ghi đè",
+            f"{len(overwritten)} file đã tồn tại trong working tree và sẽ bị ghi đè bằng bản từ {source}.\n"
+            "Thay đổi chưa commit ở các file này (nếu có) sẽ mất. Tiếp tục?",
+        ):
+            return
+
+        copy_files_from_branch(repo, source, selected)
+        self.log(f"Đã lấy {len(selected)} file từ {source} vào working tree (chưa stage):\n" + "\n".join(selected))
+
+    def load_period_commits(self):
+        repo = self.repo()
+        branch = self.period_branch_var.get()
+        if not branch:
+            raise GitError("Chưa chọn branch.")
+        since = self.parse_date(self.since_var.get(), "Từ")
+        until = self.parse_date(self.until_var.get(), "Đến")
+        if since > until:
+            raise GitError("Ngày bắt đầu lớn hơn ngày kết thúc.")
+
+        commits = commits_in_period(repo, branch, since, until)
+        self._fill_commit_tree(self.period_tree, commits)
+        self.log(f"Tìm thấy {len(commits)} commit trên {branch} từ {since} đến {until}.")
+
+    def load_cherry_candidates(self):
+        repo = self.repo()
+        source = self.source_var.get()
+        if not source:
+            raise GitError("Chưa chọn branch nguồn A.")
+        if not self.current_name:
+            raise GitError("Đang ở detached HEAD, hãy checkout một branch trước.")
+        if source == self.current_name:
+            raise GitError("Branch nguồn A đang trùng với branch hiện tại B.")
+
+        commits = commits_missing_in_target(repo, source, self.current_name)
+        self._fill_commit_tree(self.cherry_tree, commits)
+        self.log(f"Có {len(commits)} commit trong {source} chưa có trong {self.current_name}.")
+
+    def cherry_pick_selected(self):
+        repo = self.repo()
+        if not self.current_name:
+            raise GitError("Đang ở detached HEAD, hãy checkout một branch trước.")
+        selected = set(self.cherry_tree.selection())
+        hashes = [iid for iid in self.cherry_tree.get_children() if iid in selected]
+        if not hashes:
+            raise GitError("Chưa chọn commit nào.")
+        if working_tree_dirty(repo):
+            raise GitError("Working tree còn thay đổi đã tracked. Hãy commit hoặc stash trước khi cherry-pick.")
+        if not messagebox.askyesno(
+            "Xác nhận cherry-pick",
+            f"Cherry-pick {len(hashes)} commit vào {self.current_name} theo thứ tự cũ → mới?",
+        ):
+            return
+
+        code, out, err = git_run(repo, "cherry-pick", *hashes)
+        output = (out + err).decode("utf-8", errors="replace").strip()
+        if code == 0:
+            self.log(f"Cherry-pick thành công {len(hashes)} commit vào {self.current_name}.\n{output}")
+            self.load_cherry_candidates()
+            return
+
+        self.log(f"Cherry-pick lỗi:\n{output}")
+        if cherry_pick_in_progress(repo):
+            if messagebox.askyesno(
+                "Cherry-pick bị dừng",
+                "Có conflict. Abort để quay về trạng thái trước khi cherry-pick?\n"
+                "(No: tự giải quyết conflict rồi commit hoặc chạy git cherry-pick --continue.)",
+            ):
+                abort_code, abort_out, abort_err = git_run(repo, "cherry-pick", "--abort")
+                if abort_code != 0:
+                    raise GitError((abort_err or abort_out).decode("utf-8", errors="replace").strip())
+                self.log("Đã abort cherry-pick.")
+                self.load_cherry_candidates()
+            else:
+                messagebox.showinfo("Cherry-pick", "Hãy giải quyết conflict rồi commit hoặc chạy cherry-pick --continue.")
+        else:
+            messagebox.showerror("Cherry-pick lỗi", output or "Lỗi không xác định.")
+
+
+def main():
+    parser = ArgumentParser(description="Git Support Tool")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--background",
+        action="store_true",
+        help="Chạy cửa sổ Tkinter tách khỏi terminal (mặc định trên hệ POSIX).",
+    )
+    mode.add_argument(
+        "--foreground",
+        action="store_true",
+        help="Giữ tiến trình trong terminal để debug hoặc xem lỗi khởi động.",
+    )
+    args = parser.parse_args()
+
+    if args.background or (not args.foreground and os.name != "nt"):
+        if launch_background():
+            return
+
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
