@@ -9,6 +9,7 @@
 #include "uedp_msg.h"
 #include "uedp_timer.h"
 #include "uedp_itnlog.h"
+#include "uedp_ocesvc.h"
 #include "uedp_fcr.h"
 #include "fifo.h"
 
@@ -40,6 +41,7 @@ void uedp_core_init(void) {
   uedp_msg_pool_init();
   uedp_gdp_init();
   uedp_timer_init();
+  ocesvc_ctrl_init();
   uedp_itnlog_init();
   uedp_itnlog_set_output(&stm32h723_log_alloc);
   is_inited = 0x1u;
@@ -55,15 +57,25 @@ void pal_core_init(void) {
   stm32h723_config_exti_swisr();
 }
 
-//NOTE - not an optimal solution, but currently usable
+sta ui32 critical_depth = 0x0u;
+
 void pal_enter_critical(void) {
+  ui32 primask = __get_PRIMASK();
   __disable_irq();
-  primask_gvi = __get_PRIMASK();
+  if (critical_depth == 0x0u) {
+    primask_gvi = primask;
+  }
+  critical_depth++;
 }
 
 void pal_exit_critical(void) {
-  __enable_irq();
-  __set_PRIMASK(primask_gvi);
+  if (critical_depth == 0x0u) {
+    return;
+  }
+  critical_depth--;
+  if (critical_depth == 0x0u) {
+    __set_PRIMASK(primask_gvi);
+  }
 }
 
 ui8 pal_math_get_highest_bit32(ui32 mask) {
